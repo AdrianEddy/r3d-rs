@@ -58,11 +58,11 @@ fn main() -> Result<(), RedError> {
 
         let mut clip = Clip::from_path("sample.R3D")?;
 
-        println!("Clip               {:?}", clip.status());
+        println!("Clip               {:?}",  clip.status());
         println!("Resolution         {}x{}", clip.width(), clip.height());
-        println!("Video track count: {}", clip.video_track_count());
-        println!("Timecode(0):       {:?}", clip.timecode(0));
-        println!("Frames:            {}", clip.video_frame_count());
+        println!("Video track count: {}",    clip.video_track_count());
+        println!("Timecode(0):       {:?}",  clip.timecode(0));
+        println!("Frames:            {}",    clip.video_frame_count());
         println!("Metadata:");
         for (key, value) in clip.metadata_iter() {
             println!("{key: <30} {value:?}");
@@ -73,9 +73,9 @@ fn main() -> Result<(), RedError> {
         }
         println!("Processing settings:");
         let mut settings = clip.default_image_processing_settings();
-        println!("Brightness {}", settings.brightness());
-        println!("ISO        {}", settings.iso());
-        println!("Kelvin     {}", settings.kelvin());
+        println!("Brightness: {}", settings.brightness());
+        println!("ISO:        {}", settings.iso());
+        println!("Kelvin:     {}", settings.kelvin());
 
         // Set custom settings
         settings.set_hdr_peak_nits(1000);
@@ -108,7 +108,7 @@ fn main() -> Result<(), RedError> {
             job.set_image_processing(&settings);
             job.allocate_internal_buffer(&clip)?;
             job.allocate_frame_metadata();
-            // Start decoding in the backgroun
+            // Start decoding in the background
             tasks.push(decoder.decode(job)?);
         }
 
@@ -147,13 +147,13 @@ If you prefer to link the libraries yourself, add `default-features = false` to 
 
 ---
 
----
-
 ## TODO
 
 * [ ] Debayer CUDA functions
 * [ ] Debayer OpenCL functions
 * [ ] Debayer Metal functions
+* [ ] Clip audio functions
+* [ ] Clip trim functions
 * [ ] Lut3D functions
 * [ ] Camera streaming functions
 * [ ] More end-to-end examples (transcode, thumbnails, batch decode)
