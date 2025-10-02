@@ -1,0 +1,29 @@
+[package]
+name = "r3d-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Adrian <adrian.eddy at gmail>"]
+description = "Rust bindings for R3D RAW SDK"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AdrianEddy/r3d-rs"
+readme = "README.md"
+keywords = ["red", "red raw", "sdk", "video"]
+categories = ["video", "media-processing"]
+
+[features]
+default = ["link"]
+link = []
+
+[dependencies]
+bitflags = "2.9"
+cpp = "0.5"
+futures-util = "0.3"
+log = "0.4"
+libloading = "0.8"
+
+[build-dependencies]
+cpp_build = "0.5"
+
+[dev-dependencies]
+image = "0.25"
+pollster = "0.4"
