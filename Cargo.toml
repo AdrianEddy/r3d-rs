@@ -13,6 +13,7 @@ categories = ["video", "media-processing"]
 [features]
 default = ["link"]
 link = []
+metal-debayer = []
 
 [dependencies]
 bitflags = "2.9"

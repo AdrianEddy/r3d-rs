@@ -9,7 +9,7 @@ mod cuda;
 #[cfg(not(target_os = "macos"))]
 pub use cuda::*;
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal-debayer")]
 mod metal;
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal-debayer")]
 pub use metal::*;
