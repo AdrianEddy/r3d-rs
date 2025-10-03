@@ -178,6 +178,22 @@ impl DebayerCudaJob {
             ptr->output_device_mem = p;
         });
     }
+    pub fn raw_host_mem(&self) -> *mut c_void {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] -> *mut c_void as "void *" { return ptr->raw_host_mem; })
+    }
+    pub fn raw_device_mem(&self) -> *mut c_void {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] -> *mut c_void as "void *" { return ptr->raw_device_mem; })
+    }
+    pub fn output_device_mem(&self) -> *mut c_void {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] -> *mut c_void as "void *" { return ptr->output_device_mem; })
+    }
+    pub fn output_device_size(&self) -> usize {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] -> usize as "size_t" { return ptr->output_device_mem_size; })
+    }
 
     pub fn set_mode(&mut self, mode: VideoDecodeMode) {
         let ptr = self.ptr;

@@ -87,6 +87,7 @@ pub enum RedError {
 
     CudaError(i32),
     OpenCLError(i32),
+    MetalError(i32),
 
     BufferTooSmall { needed: usize, provided: usize },
     Alloc(std::alloc::LayoutError),
@@ -163,6 +164,7 @@ impl std::fmt::Display for RedError {
 
             Self::CudaError(cuda_error)             => write!(f, "CUDA error: {cuda_error}"),
             Self::OpenCLError(opencl_error)         => write!(f, "OpenCL error: {opencl_error}"),
+            Self::MetalError(metal_error)           => write!(f, "Metal error: {metal_error}"),
             Self::Alloc(e)                          => write!(f, "Allocation error: {e}"),
 
             Self::Other(s)                          => write!(f, "RED error: {s}"),

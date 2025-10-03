@@ -8,6 +8,7 @@ fn main() {
     config
         .flag_if_supported("-std=c++14")
         .flag_if_supported("-fno-rtti")
+        .flag_if_supported("-xobjective-c++")
         .include(&include_path)
         .include("headers/")
         .build("src/lib.rs");
@@ -34,6 +35,7 @@ fn main() {
         } else if cfg!(target_os = "macos") {
             println!("cargo:rustc-link-search={sdk_path}/Lib/mac64");
             println!("cargo:rustc-link-lib=R3DSDK-libcpp");
+            println!("cargo:rustc-link-lib=framework=Metal");
         } else if cfg!(target_os = "linux") {
             println!("cargo:rustc-link-search={sdk_path}/Lib/linux64");
             println!("cargo:rustc-link-lib=R3DSDKPIC-cpp11");

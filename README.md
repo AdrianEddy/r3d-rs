@@ -149,7 +149,6 @@ If you prefer to link the libraries yourself, add `default-features = false` to 
 
 ## TODO
 
-* [ ] Debayer Metal functions
 * [ ] Clip audio functions
 * [ ] Clip trim functions
 * [ ] Lut3D functions
