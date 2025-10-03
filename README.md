@@ -152,7 +152,6 @@ If you prefer to link the libraries yourself, add `default-features = false` to 
 * [ ] Clip audio functions
 * [ ] Clip trim functions
 * [ ] Lut3D functions
-* [ ] ImageProcessingLimits
 * [ ] Camera streaming functions
 * [ ] More end-to-end examples (transcode, thumbnails, batch decode)
 

@@ -14,3 +14,4 @@ mod metadata;     pub use metadata::*;
 mod r3ddecoder;   pub use r3ddecoder::*;
 mod sdk;          pub use sdk::*;
 mod image_processing_settings; pub use image_processing_settings::*;
+mod image_processing_limits;   pub use image_processing_limits::*;

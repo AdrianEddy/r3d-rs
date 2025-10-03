@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/debayer/metal.rs");
     println!("cargo:rerun-if-changed=src/debayer/opencl.rs");
     println!("cargo:rerun-if-changed=src/image_processing_settings.rs");
+    println!("cargo:rerun-if-changed=src/image_processing_limits.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/metadata.rs");
     println!("cargo:rerun-if-changed=src/r3ddecoder.rs");
