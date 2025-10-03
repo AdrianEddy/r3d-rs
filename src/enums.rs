@@ -49,32 +49,74 @@ pub enum FileType {
 	Audio    = 5
 }
 
+/// The different resolutions and qualities the clip can be
+/// decoded at. This list expand over time.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum VideoDecodeMode {
-    FullResPremium   = 1145459280,
-    HalfResPremium   = 1145590352,
-    HalfResGood      = 1145590343,
-    QuarterResGood   = 1146180167,
-    EightResGood     = 1145393735,
-    SixteenthResGood = 1146311239,
+	/// 'DFRP', full resolution, slow, but highest resolution & quality
+    FullResPremium   = 0x44465250,
+    /// 'DHRP', half resolution, slow, but highest quality
+    HalfResPremium   = 0x44485250,
+    /// 'DHRG', half resolution, fast, still very good quality
+    HalfResGood      = 0x44485247,
+    /// 'DQRG', quarter resolution, fast, very good quality
+    QuarterResGood   = 0x44515247,
+    /// 'DERG', eight resolution, fast, good quality
+    EightResGood     = 0x44455247,
+    /// 'DSRG', sixteenth resolution, fast, good quality
+    SixteenthResGood = 0x44535247,
 }
+
+/// The different pixel types to decode images at. The 16-bit RGB
+/// planar format has always existed in the SDK but is not supported
+/// for RED Rocket decoding. The other two formats are interleaved
+/// and are supported for both software and RED Rocket decoding.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum VideoPixelType {
-    Rgb16bitInterleaved     = 1380070985,
-    RgbHalfFloatInterleaved = 1380075590,
-    RgbHalfFloatAcesInt     = 1380075585,
-    Rgb16bitPlanar          = 1380070992,
-    Bgr8bitInterleaved      = 1111970360,
-    Bgra8bitInterleaved     = 1112686904,
-    Dpx10bitMethodB         = 1146105922,
+    /// Interleaved RGB decoding in 16-bits per pixel 4K decodes in this 16-bit pixel type using the Rocket will not be real time.
+    /// Use the 12- or 10-bit pixel types below for 4K real time needs
+	/// Supported by software and RED Rocket decode
+    Rgb16bitInterleaved     = 0x52423649,
+    /// 16-bit half-float decoding. These ImageProcessingSettings fields are ignored:
+	/// - GammaCurve (will always be linear)
+	/// - Contrast
+	/// - Brightness
+	/// - Saturation
+	/// - RGB gains
+	/// - Shadow
+	/// - UserCurve, UserCurveRed, UserCurveGreen & UserCurveBlue
+	/// - LggRed, LggGreen & LggBlue
+	/// - CustomPDLogBlackPoint, CustomPDLogWhitePoint & CustomPDLogGamma
+    RgbHalfFloatInterleaved = 0x52424846,
+    /// 16-bit half-float ACES decoding. These ImageProcessingSettings fields are ignored:
+	/// - Same fields as PixelType_HalfFloat_RGB_Interleaved pixel type
+	/// - ColorSpace (will always be set to ACES AP0)
+    RgbHalfFloatAcesInt     = 0x52424841,
+    /// Planar RGB decoding in 16-bits per pixel
+	/// Supported by software decode only
+    Rgb16bitPlanar          = 0x52423650,
+    // Interleaved BGR 8-bit
+    Bgr8bitInterleaved      = 0x42475238,
+    // Interleaved BGRA decoding in 8 bits per pixel, alpha channel = 0xFF
+    Bgra8bitInterleaved     = 0x42524138,
+    // Interleaved RGB 10-bit DPX Method B
+    Dpx10bitMethodB         = 0x44503042,
 }
+
+/// HDRx blending algorithm to use when doing HDR blending
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum HdrBlendAlgorithm {
-    HDRxSimpleBlend = 1212437075,
-    HDRxMagicMotion = 1212437069,
+    /// Simple blend, exactly as implemented in 12_SimpleHDRxBlend
+	/// On the Rocket this will ALWAYS decode in 16-bit to do the blend
+	/// This can result in slow downs at full resolution. If you need a
+	/// preview option in 8-bit then decode 2 images in 8-bit and
+	/// implement the simple blend as per sample code 12_SimpleHDRxBlend
+    HDRxSimpleBlend = 0x48445253,
+    /// Magic Motion, more sophisticated blend
+    HDRxMagicMotion = 0x4844524D,
 }
 
 #[repr(i32)]
@@ -318,8 +360,11 @@ pub struct SlopeOffsetPower {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IMUSample {
+    /// in microseconds, see RMD_FRAME_TIMESTAMP + Clip::frame_metadata()
     pub timestamp: u64,
+    /// in G's
     pub acceleration: Axes,
+    /// in deg/s
     pub rotation: Axes,
 }
 #[repr(C)]
