@@ -149,8 +149,6 @@ If you prefer to link the libraries yourself, add `default-features = false` to 
 
 ## TODO
 
-* [ ] Debayer CUDA functions
-* [ ] Debayer OpenCL functions
 * [ ] Debayer Metal functions
 * [ ] Clip audio functions
 * [ ] Clip trim functions

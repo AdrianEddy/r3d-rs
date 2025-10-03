@@ -80,7 +80,14 @@ pub enum RedError {
     /// Error loading R3DSDK dynamic library
     UnableToLoadLibrary,
 
+    InvalidJobParameterDeviceId,
+
     BufferNotAligned,
+    InvalidAPIObject,
+
+    CudaError(i32),
+    OpenCLError(i32),
+
     BufferTooSmall { needed: usize, provided: usize },
     Alloc(std::alloc::LayoutError),
     Other(String),
@@ -148,10 +155,14 @@ impl std::fmt::Display for RedError {
             Self::UnableToUseGPUDevice              => write!(f, "Unable to use GPU device"),
             Self::NoGPUDeviceSpecified              => write!(f, "No GPU device specified"),
             Self::UnableToLoadLibrary               => write!(f, "Unable to load library"),
+            Self::InvalidJobParameterDeviceId       => write!(f, "Invalid job parameter: device ID"),
 
             Self::BufferNotAligned                  => write!(f, "Buffer not aligned"),
+            Self::InvalidAPIObject                  => write!(f, "Invalid API object"),
             Self::BufferTooSmall { needed, provided } => write!(f, "Buffer too small: needed {needed} bytes, provided {provided} bytes"),
 
+            Self::CudaError(cuda_error)             => write!(f, "CUDA error: {cuda_error}"),
+            Self::OpenCLError(opencl_error)         => write!(f, "OpenCL error: {opencl_error}"),
             Self::Alloc(e)                          => write!(f, "Allocation error: {e}"),
 
             Self::Other(s)                          => write!(f, "RED error: {s}"),

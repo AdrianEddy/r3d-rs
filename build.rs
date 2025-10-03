@@ -6,7 +6,10 @@ fn main() {
     let mut config = cpp_build::Config::new();
 
     config
+        .flag_if_supported("-std=c++14")
+        .flag_if_supported("-fno-rtti")
         .include(&include_path)
+        .include("headers/")
         .build("src/lib.rs");
 
     println!("cargo:rerun-if-changed=src/asyncdecoder.rs");
@@ -22,6 +25,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/sdk.rs");
 
     println!("cargo:rustc-include-search={sdk_path}/Include");
+    println!("cargo:rustc-include-search=headers/");
 
     if cfg!(feature = "link") {
         if cfg!(target_os = "windows") {
@@ -32,7 +36,7 @@ fn main() {
             println!("cargo:rustc-link-lib=R3DSDK-libcpp");
         } else if cfg!(target_os = "linux") {
             println!("cargo:rustc-link-search={sdk_path}/Lib/linux64");
-            println!("cargo:rustc-link-lib=R3DSDK-cpp11");
+            println!("cargo:rustc-link-lib=R3DSDKPIC-cpp11");
         }
     }
 }

@@ -17,7 +17,7 @@ cpp!{{
 
     struct RustIO : public R3DSDK::IOInterface {
         void *instance{nullptr};
-        RustIO(void *inst) : instance(inst) { }
+        RustIO(void *inst) : R3DSDK::IOInterface(), instance(inst) { }
 
         R3DSDK::IOInterface::Handle Open(const char *utf8Path, R3DSDK::IOInterface::FileAccess access) override {
             return rs_io_open(instance, utf8Path, (int)access);

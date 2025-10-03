@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 mod asyncdecoder; pub use asyncdecoder::*;
 mod clip;         pub use clip::*;

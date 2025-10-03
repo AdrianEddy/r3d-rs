@@ -4,7 +4,226 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
+use cpp::*;
+use crate::{ RedResult, RedError, enums::*, image_processing_settings::ImageProcessingSettings };
+use core::ffi::c_void;
+
+cpp!{{
+    #include "R3DSDKCuda.h"
+}}
+
+/// Opaque handle to CUDA stream from cudart
+pub type CudaStream = *mut c_void;
+
+pub struct RedCuda {
+    ptr: *mut c_void,
+}
+
+impl RedCuda {
+    /// Create REDCuda wrapper and bind cudart functions dynamically
+    pub fn new() -> RedResult<Self> {
+        let funcs = CUDA.as_ref().map_err(|_| RedError::RedCudaLibraryNotFound)?;
+
+        let p_cudaFree                 = *funcs.cudaFree                 as *const () as usize;
+        let p_cudaFreeArray            = *funcs.cudaFreeArray            as *const () as usize;
+        let p_cudaFreeHost             = *funcs.cudaFreeHost             as *const () as usize;
+        let p_cudaFreeMipmappedArray   = *funcs.cudaFreeMipmappedArray   as *const () as usize;
+        let p_cudaHostAlloc            = *funcs.cudaHostAlloc            as *const () as usize;
+        let p_cudaMalloc               = *funcs.cudaMalloc               as *const () as usize;
+        let p_cudaMalloc3D             = *funcs.cudaMalloc3D             as *const () as usize;
+        let p_cudaMalloc3DArray        = *funcs.cudaMalloc3DArray        as *const () as usize;
+        let p_cudaMallocArray          = *funcs.cudaMallocArray          as *const () as usize;
+        let p_cudaMallocHost           = *funcs.cudaMallocHost           as *const () as usize;
+        let p_cudaMallocMipmappedArray = *funcs.cudaMallocMipmappedArray as *const () as usize;
+        let p_cudaMallocPitch          = *funcs.cudaMallocPitch          as *const () as usize;
+        let ptr = cpp!(unsafe [
+            p_cudaFree as "uintptr_t",
+            p_cudaFreeArray as "uintptr_t",
+            p_cudaFreeHost as "uintptr_t",
+            p_cudaFreeMipmappedArray as "uintptr_t",
+            p_cudaHostAlloc as "uintptr_t",
+            p_cudaMalloc as "uintptr_t",
+            p_cudaMalloc3D as "uintptr_t",
+            p_cudaMalloc3DArray as "uintptr_t",
+            p_cudaMallocArray as "uintptr_t",
+            p_cudaMallocHost as "uintptr_t",
+            p_cudaMallocMipmappedArray as "uintptr_t",
+            p_cudaMallocPitch as "uintptr_t"
+        ] -> *mut c_void as "R3DSDK::REDCuda *" {
+            R3DSDK::EXT_CUDA_API api;
+            api.cudaFree                 = reinterpret_cast<decltype(api.cudaFree)>(p_cudaFree);
+            api.cudaFreeArray            = reinterpret_cast<decltype(api.cudaFreeArray)>(p_cudaFreeArray);
+            api.cudaFreeHost             = reinterpret_cast<decltype(api.cudaFreeHost)>(p_cudaFreeHost);
+            api.cudaFreeMipmappedArray   = reinterpret_cast<decltype(api.cudaFreeMipmappedArray)>(p_cudaFreeMipmappedArray);
+            api.cudaHostAlloc            = reinterpret_cast<decltype(api.cudaHostAlloc)>(p_cudaHostAlloc);
+            api.cudaMalloc               = reinterpret_cast<decltype(api.cudaMalloc)>(p_cudaMalloc);
+            api.cudaMalloc3D             = reinterpret_cast<decltype(api.cudaMalloc3D)>(p_cudaMalloc3D);
+            api.cudaMalloc3DArray        = reinterpret_cast<decltype(api.cudaMalloc3DArray)>(p_cudaMalloc3DArray);
+            api.cudaMallocArray          = reinterpret_cast<decltype(api.cudaMallocArray)>(p_cudaMallocArray);
+            api.cudaMallocHost           = reinterpret_cast<decltype(api.cudaMallocHost)>(p_cudaMallocHost);
+            api.cudaMallocMipmappedArray = reinterpret_cast<decltype(api.cudaMallocMipmappedArray)>(p_cudaMallocMipmappedArray);
+            api.cudaMallocPitch          = reinterpret_cast<decltype(api.cudaMallocPitch)>(p_cudaMallocPitch);
+            return new R3DSDK::REDCuda(api);
+        });
+
+        Ok(Self { ptr })
+    }
+
+    pub fn create_debayer_job(&self) -> DebayerCudaJob {
+        let cuda = self.ptr;
+        let ptr = cpp!(unsafe [cuda as "R3DSDK::REDCuda *"] -> *mut c_void as "void*" {
+            return (void*)cuda->createDebayerJob();
+        });
+        DebayerCudaJob { ptr, owner: self.ptr }
+    }
+
+	/// checks to see if a device and stream queue are compatible with REDCuda
+	/// This call may take several seconds on slower cards
+    pub fn check_compatibility(&self, device_id: i32, stream: CudaStream) -> RedResult<()> {
+        let cuda = self.ptr;
+        let mut cuda_error: cudaError_t = 0;
+        let cuda_error_ptr = &mut cuda_error;
+        let status: CudaStatus = unsafe { std::mem::transmute(cpp!([cuda as "R3DSDK::REDCuda *", device_id as "int", stream as "cudaStream_t", cuda_error_ptr as "cudaError_t *"] -> i32 as "int" {
+            return (int)cuda->checkCompatibility(device_id, stream, *cuda_error_ptr);
+        })) };
+        if status == CudaStatus::Ok {
+            if cuda_error == 0 { Ok(()) } else { Err(RedError::CudaError(cuda_error)) }
+        } else {
+            Err(status.into())
+        }
+    }
+
+	/// processes a frame.
+	/// Thread safe blocking call
+	/// This function will enqueue the cuda kernels and wait for the processing to complete
+    ///
+	///	To ensure memory buffers are not released prior to completion of kernel deviceId and stream are used as tokens for internal object mapping.
+	///	Be sure you have already done setCudaDevice on the thread using the passed in deviceId prior to calling process
+    pub fn process_blocking(&self, device_id: i32, stream: CudaStream, debayer_job: &mut DebayerCudaJob) -> RedResult<()> {
+        let cuda = self.ptr;
+        let job = debayer_job.ptr;
+        let mut cuda_error: cudaError_t = 0;
+        let cuda_error_ptr = &mut cuda_error;
+        let status: CudaStatus = unsafe { std::mem::transmute(cpp!([cuda as "R3DSDK::REDCuda *", device_id as "int", stream as "cudaStream_t", job as "R3DSDK::DebayerCudaJob *", cuda_error_ptr as "cudaError_t *"] -> i32 as "int" {
+            return (int)cuda->process(device_id, stream, job, *cuda_error_ptr);
+        })) };
+        if status == CudaStatus::Ok {
+            if cuda_error == 0 { Ok(()) } else { Err(RedError::CudaError(cuda_error)) }
+        } else {
+            Err(status.into())
+        }
+    }
+	/// enqueues all red processing on the current stream
+	/// once processAsync has been called you will need to call debayerJob->completeAsync
+    ///
+	///	This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
+	///	If the commands have already completed there is no wait involved
+	// Status processAsync(int deviceId, cudaStream_t stream, DebayerCudaJob *debayerJobAsync, cudaError_t &cuda_error);
+    pub fn process_async(&self, device_id: i32, stream: CudaStream, debayer_job: &mut DebayerCudaJob) -> RedResult<()> {
+        let cuda = self.ptr;
+        let job_ptr = debayer_job.ptr;
+        let mut cuda_error: cudaError_t = 0;
+        let cuda_error_ptr = &mut cuda_error;
+        let status: CudaStatus = unsafe { std::mem::transmute(cpp!([cuda as "R3DSDK::REDCuda *", device_id as "int", stream as "cudaStream_t", job_ptr as "R3DSDK::DebayerCudaJob *", cuda_error_ptr as "cudaError_t *"] -> i32 as "int" {
+            return (int)cuda->processAsync(device_id, stream, job_ptr, *cuda_error_ptr);
+        })) };
+        if status == CudaStatus::Ok {
+            if cuda_error == 0 { Ok(()) } else { Err(RedError::CudaError(cuda_error)) }
+        } else {
+            Err(status.into())
+        }
+    }
+}
+
+impl Drop for RedCuda {
+    fn drop(&mut self) {
+        let cuda = self.ptr;
+        cpp!(unsafe [cuda as "R3DSDK::REDCuda *"] { delete cuda; });
+    }
+}
+
+pub struct DebayerCudaJob {
+    ptr: *mut c_void,   // R3DSDK::DebayerCudaJob *
+    owner: *mut c_void, // R3DSDK::REDCuda *
+}
+
+impl DebayerCudaJob {
+    pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
+
+    pub fn result_frame_size(&self) -> usize {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "const R3DSDK::DebayerCudaJob *"] -> usize as "size_t" {
+            return R3DSDK::DebayerCudaJob::ResultFrameSize(ptr);
+        })
+    }
+
+    /// NOTE: Must remain valid until process/processAsync/completeAsync sequence completes
+    pub fn set_raw_host_mem(&mut self, p: *mut c_void) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", p as "void *"] {
+            ptr->raw_host_mem = p;
+        });
+    }
+    /// Same data as raw_host_mem but already on the GPU
+    pub fn set_raw_device_mem(&mut self, p: *mut c_void) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", p as "void *"] {
+            ptr->raw_device_mem = p;
+        });
+    }
+    pub fn set_output_device_mem(&mut self, p: *mut c_void, size: usize) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", p as "void *", size as "size_t"] {
+            ptr->output_device_mem_size = size;
+            ptr->output_device_mem = p;
+        });
+    }
+
+    pub fn set_mode(&mut self, mode: VideoDecodeMode) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", mode as "int"] {
+            ptr->mode = (R3DSDK::VideoDecodeMode)mode;
+        });
+    }
+
+    pub fn set_image_processing(&mut self, v: &ImageProcessingSettings) {
+        let ptr = self.ptr;
+        let v = v as *const _;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", v as "R3DSDK::ImageProcessingSettings *"] {
+            ptr->imageProcessingSettings = v;
+        });
+    }
+
+    pub fn set_pixel_type(&mut self, pixel_type: VideoPixelType) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", pixel_type as "int"] {
+            ptr->pixelType = (R3DSDK::VideoPixelType)pixel_type;
+        });
+    }
+
+    /// Wait for async kernels completion and clean up frame resources
+    pub fn complete_async(&mut self) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] {
+            ptr->completeAsync();
+        });
+    }
+}
+
+impl Drop for DebayerCudaJob {
+    fn drop(&mut self) {
+        // Ensure completion
+        self.complete_async();
+        let owner = self.owner;
+        let ptr = self.ptr;
+        cpp!(unsafe [owner as "R3DSDK::REDCuda *", ptr as "R3DSDK::DebayerCudaJob *"] {
+            owner->releaseDebayerJob(ptr);
+        });
+    }
+}
+
 #[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum CudaStatus {
 	Ok = 0,
 	ErrorProcessing = 1,
@@ -32,12 +251,26 @@ pub enum CudaStatus {
     InvalidJobParameter_deviceId = 13
 }
 
-
-
-
-
-
-
+impl From<CudaStatus> for RedError {
+    fn from(value: CudaStatus) -> Self {
+        match value {
+            CudaStatus::Ok => panic!("Cannot convert Ok to RedError"),
+            CudaStatus::ErrorProcessing => RedError::ErrorProcessing,
+            CudaStatus::InvalidJobParameter => RedError::InvalidJobParameter,
+            CudaStatus::InvalidJobParameter_mode => RedError::InvalidJobParameterMode,
+            CudaStatus::InvalidJobParameter_raw_host_mem => RedError::InvalidJobParameterRawHostMem,
+            CudaStatus::InvalidJobParameter_raw_device_mem => RedError::InvalidJobParameterRawDeviceMem,
+            CudaStatus::InvalidJobParameter_pixelType => RedError::InvalidPixelType,
+            CudaStatus::InvalidJobParameter_output_device_mem_size => RedError::InvalidJobParameterOutputDeviceMemSize,
+            CudaStatus::InvalidJobParameter_output_device_mem => RedError::InvalidJobParameterOutputDeviceMem,
+            CudaStatus::InvalidJobParameter_ColorVersion1 => RedError::InvalidJobParameterColorVersion1,
+            CudaStatus::UnableToUseGPUDevice => RedError::UnableToUseGPUDevice,
+            CudaStatus::UnableToLoadLibrary => RedError::UnableToLoadLibrary,
+            CudaStatus::ParameterUnsupported => RedError::ParameterUnsupported,
+            CudaStatus::InvalidJobParameter_deviceId => RedError::InvalidJobParameterDeviceId,
+        }
+    }
+}
 
 //////////////////////////////////////// CUDA FFI ////////////////////////////////////////
 
@@ -47,6 +280,8 @@ use libloading::os::windows as dl;
 use libloading::os::unix as dl;
 
 use std::sync::LazyLock;
+
+pub type cudaError_t = i32;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Hash, PartialOrd, Ord, PartialEq, Eq)]
@@ -88,18 +323,18 @@ pub struct cudaPitchedPtr {
 pub struct CudaFunctions {
     _cudart: dl::Library,
 
-    pub cudaFree:                 dl::Symbol<unsafe extern "C" fn(ptr: *mut ::core::ffi::c_void) -> i32>,
-    pub cudaFreeArray:            dl::Symbol<unsafe extern "C" fn(array: cudaArray_t) -> i32>,
-    pub cudaFreeHost:             dl::Symbol<unsafe extern "C" fn(ptr: *mut ::core::ffi::c_void) -> i32>,
-    pub cudaFreeMipmappedArray:   dl::Symbol<unsafe extern "C" fn(mipmappedArray: cudaMipmappedArray_t) -> i32>,
-    pub cudaHostAlloc:            dl::Symbol<unsafe extern "C" fn(pHost: *mut *mut ::core::ffi::c_void, size: usize, flags: ::core::ffi::c_uint) -> i32>,
-    pub cudaMalloc:               dl::Symbol<unsafe extern "C" fn(devPtr: *mut *mut ::core::ffi::c_void, size: usize) -> i32>,
-    pub cudaMalloc3D:             dl::Symbol<unsafe extern "C" fn(pitchedDevPtr: *mut cudaPitchedPtr, extent: cudaExtent) -> i32>,
-    pub cudaMalloc3DArray:        dl::Symbol<unsafe extern "C" fn(array: *mut cudaArray_t, desc: *const cudaChannelFormatDesc, extent: cudaExtent, flags: ::core::ffi::c_uint) -> i32>,
-    pub cudaMallocArray:          dl::Symbol<unsafe extern "C" fn(array: *mut cudaArray_t, desc: *const cudaChannelFormatDesc, width: usize, height: usize, flags: ::core::ffi::c_uint) -> i32>,
-    pub cudaMallocHost:           dl::Symbol<unsafe extern "C" fn(ptr: *mut *mut ::core::ffi::c_void, size: usize) -> i32>,
-    pub cudaMallocMipmappedArray: dl::Symbol<unsafe extern "C" fn(mipmappedArray: *mut cudaMipmappedArray_t, desc: *const cudaChannelFormatDesc, extent: cudaExtent, numLevels: ::core::ffi::c_uint, flags: ::core::ffi::c_uint) -> i32>,
-    pub cudaMallocPitch:          dl::Symbol<unsafe extern "C" fn(devPtr: *mut *mut ::core::ffi::c_void, pitch: *mut usize, width: usize, height: usize) -> i32>,
+    pub cudaFree:                 dl::Symbol<unsafe extern "C" fn(ptr: *mut ::core::ffi::c_void) -> cudaError_t>,
+    pub cudaFreeArray:            dl::Symbol<unsafe extern "C" fn(array: cudaArray_t) -> cudaError_t>,
+    pub cudaFreeHost:             dl::Symbol<unsafe extern "C" fn(ptr: *mut ::core::ffi::c_void) -> cudaError_t>,
+    pub cudaFreeMipmappedArray:   dl::Symbol<unsafe extern "C" fn(mipmappedArray: cudaMipmappedArray_t) -> cudaError_t>,
+    pub cudaHostAlloc:            dl::Symbol<unsafe extern "C" fn(pHost: *mut *mut ::core::ffi::c_void, size: usize, flags: ::core::ffi::c_uint) -> cudaError_t>,
+    pub cudaMalloc:               dl::Symbol<unsafe extern "C" fn(devPtr: *mut *mut ::core::ffi::c_void, size: usize) -> cudaError_t>,
+    pub cudaMalloc3D:             dl::Symbol<unsafe extern "C" fn(pitchedDevPtr: *mut cudaPitchedPtr, extent: cudaExtent) -> cudaError_t>,
+    pub cudaMalloc3DArray:        dl::Symbol<unsafe extern "C" fn(array: *mut cudaArray_t, desc: *const cudaChannelFormatDesc, extent: cudaExtent, flags: ::core::ffi::c_uint) -> cudaError_t>,
+    pub cudaMallocArray:          dl::Symbol<unsafe extern "C" fn(array: *mut cudaArray_t, desc: *const cudaChannelFormatDesc, width: usize, height: usize, flags: ::core::ffi::c_uint) -> cudaError_t>,
+    pub cudaMallocHost:           dl::Symbol<unsafe extern "C" fn(ptr: *mut *mut ::core::ffi::c_void, size: usize) -> cudaError_t>,
+    pub cudaMallocMipmappedArray: dl::Symbol<unsafe extern "C" fn(mipmappedArray: *mut cudaMipmappedArray_t, desc: *const cudaChannelFormatDesc, extent: cudaExtent, numLevels: ::core::ffi::c_uint, flags: ::core::ffi::c_uint) -> cudaError_t>,
+    pub cudaMallocPitch:          dl::Symbol<unsafe extern "C" fn(devPtr: *mut *mut ::core::ffi::c_void, pitch: *mut usize, width: usize, height: usize) -> cudaError_t>,
 }
 
 impl CudaFunctions {
