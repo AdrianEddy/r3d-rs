@@ -70,7 +70,7 @@ impl AsyncDecoder {
                 job_ptr->PrivateData = state_ptr;
                 return ptr->DecodeForGpuSdk(*job_ptr);
             }));
-            if status != DecodeStatus::DSDecodeOK {
+            if status != DecodeStatus::Ok {
                 Err(RedError::from(status))
             } else {
                 Ok(CallbackFuture { state })
@@ -117,7 +117,7 @@ impl GpuDecoder {
             let status: DecodeStatus = std::mem::transmute(cpp!([clip_ptr as "const R3DSDK::Clip *"] -> i32 as "int" {
                 return (R3DSDK::DecodeStatus)R3DSDK::GpuDecoder::DecodeSupportedForClip(*clip_ptr);
             }));
-            status == DecodeStatus::DSDecodeOK
+            status == DecodeStatus::Ok
         }
     }
 
@@ -154,7 +154,7 @@ impl GpuDecoder {
                 job_ptr->PrivateData = state_ptr;
                 return ptr->DecodeForGpuSdk(*job_ptr);
             }));
-            if status != DecodeStatus::DSDecodeOK {
+            if status != DecodeStatus::Ok {
                 Err(RedError::from(status))
             } else {
                 Ok(CallbackFuture { state })
@@ -319,7 +319,7 @@ extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */,
     {
         let mut lock = state.result.lock().unwrap();
         let org_job = state.job.take().unwrap();
-        if decode_status == DecodeStatus::DSDecodeOK {
+        if decode_status == DecodeStatus::Ok {
             *lock = Some(Ok(org_job));
         } else {
             *lock = Some(Err(RedError::from(decode_status)));

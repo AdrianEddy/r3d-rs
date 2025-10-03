@@ -23,7 +23,7 @@ impl Sdk {
             let status: InitializeStatus = std::mem::transmute(cpp!(unsafe [c_ptr as "const char *", flags as "unsigned int"] -> i32 as "int" {
                 return (int)R3DSDK::InitializeSdk(c_ptr, flags);
             }));
-            if status == InitializeStatus::ISInitializeOK {
+            if status == InitializeStatus::Ok {
                 Ok(Sdk {})
             } else {
                 Err(status.into())

@@ -38,7 +38,7 @@ impl Clip {
 		let c_ptr = c_path.as_ptr();
         let clip = cpp!(unsafe [c_ptr as "const char *"] -> Clip as "std::unique_ptr<R3DSDK::Clip>" { return std::make_unique<R3DSDK::Clip>(c_ptr); });
         let status = clip.status();
-        if status == LoadStatus::LSClipLoaded {
+        if status == LoadStatus::ClipLoaded {
             Ok(clip)
         } else {
             Err(status.into())
@@ -63,7 +63,7 @@ impl Clip {
         let status: LoadStatus = unsafe { std::mem::transmute(cpp!([self as "const std::unique_ptr<R3DSDK::Clip> *", c_ptr as "const char *"] -> i32 as "int" {
             return (int)(*self)->LoadFrom(c_ptr);
         })) };
-        if status == LoadStatus::LSClipLoaded {
+        if status == LoadStatus::ClipLoaded {
             Ok(())
         } else {
             Err(status.into())
@@ -109,7 +109,7 @@ impl Clip {
 			return (int)(*self)->CheckFrame(video_frame_no);
 		})) };
         match status {
-            DecodeStatus::DSDecodeOK => Ok(()),
+            DecodeStatus::Ok => Ok(()),
             status => Err(status.into()),
         }
     }
@@ -239,7 +239,7 @@ impl Clip {
 					return (int)(*self)->DecodeVideoFrame(video_frame_no, *job_ref);
 				})) };
 				match result {
-					DecodeStatus::DSDecodeOK => Ok(None),
+					DecodeStatus::Ok => Ok(None),
 					s => Err(s.into()),
 				}
 			}
@@ -251,7 +251,7 @@ impl Clip {
 				let status: DecodeStatus = unsafe { std::mem::transmute(cpp!([self as "const std::unique_ptr<R3DSDK::Clip> *", video_frame_no as "size_t", job_ref as "const R3DSDK::VideoDecodeJob *"] -> i32 as "int" {
 					return (int)(*self)->DecodeVideoFrame(video_frame_no, *job_ref);
 				})) };
-				if status != DecodeStatus::DSDecodeOK {
+				if status != DecodeStatus::Ok {
 					return Err(status.into());
 				}
 
@@ -427,7 +427,7 @@ impl Clip {
 			return (*self)->GetFrameMetadata(*metadata_ptr, video_frame_no);
 		})) };
         match status {
-            DecodeStatus::DSDecodeOK => Ok(metadata),
+            DecodeStatus::Ok => Ok(metadata),
             status => Err(status.into()),
         }
 	}
