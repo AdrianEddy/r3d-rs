@@ -4,6 +4,7 @@
 use bitflags::bitflags;
 bitflags! {
     /// Bit flags that can be passed to InitializeSdk() through the optional_components parameter
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub struct InitializeFlags: u32 {
         const None = 0;
         const Cuda = 0x01;
