@@ -3,7 +3,7 @@
 
 use crate::enums::*;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RedError {
 
     // Initialization errors
