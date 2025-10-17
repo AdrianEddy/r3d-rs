@@ -309,7 +309,7 @@ struct HandleState<T> {
 
 /// Read-only IO backed by user-provided homogeneous Read+Seek streams (all T).
 pub struct StreamIo<T: Read + Seek + Send + Sync + 'static> {
-    // filename -> (stream, filesize)
+    /// filename -> (stream, filesize)
     table: HashMap<String, (Arc<Mutex<T>>, u64)>,
 }
 

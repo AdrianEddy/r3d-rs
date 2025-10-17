@@ -13,6 +13,7 @@ fn main() {
         .include("headers/")
         .build("src/lib.rs");
 
+    println!("cargo:rerun-if-env-changed=REDSDK_PATH");
     println!("cargo:rerun-if-changed=src/asyncdecoder.rs");
     println!("cargo:rerun-if-changed=src/clip.rs");
     println!("cargo:rerun-if-changed=src/custom_io.rs");

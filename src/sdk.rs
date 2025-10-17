@@ -45,7 +45,7 @@ impl Sdk {
         }
     }
 
-    /// Identify the type of file / clip in a quick way without full parsing. This
+    /*/// Identify the type of file / clip in a quick way without full parsing. This
     /// is particularly useful to determine if a clip can have multiple file parts
     /// (FileId::R3D) that should be presented as a single clip or if each file is
     /// its own individual clip. A positive identification of a format does not
@@ -59,7 +59,7 @@ impl Sdk {
             4 => FileId::R3dNe,
             _ => FileId::Unknown,
         }
-    }
+    }*/
 }
 
 impl Drop for Sdk {
