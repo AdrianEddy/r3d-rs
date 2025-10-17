@@ -27,7 +27,7 @@ Safe, ergonomic, and async-first Rust bindings for **R3D RAW SDK**.
 ### Requirements
 
 * Install **R3D RAW SDK** for your platform.
-* Set `REDSDK_PATH` variable to point to the sdk files
+* Set `R3DSDK_DIR` variable to point to the sdk files
 * At runtime, make sure the SDK redistributable files are discoverable:
 
   * **Windows**: `RED*-x64.dll` in the executable dir or on `PATH`.
@@ -141,7 +141,7 @@ fn main() -> Result<(), RedError> {
 ## SDK loading details
 
 This crate **requires the R3D SDK libraries at build time** to be able to link them when compiling.
-Set `REDSDK_PATH` to the SDK root dir
+Set `R3DSDK_DIR` to the SDK root dir
 
 If you prefer to link the libraries yourself, add `default-features = false` to your Cargo.toml
 

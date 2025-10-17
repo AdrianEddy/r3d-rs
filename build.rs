@@ -1,5 +1,5 @@
 fn main() {
-    let sdk_path = std::env::var("REDSDK_PATH").unwrap_or_else(|_| "sdk".to_string());
+    let sdk_path = std::env::var("R3DSDK_DIR").unwrap_or_else(|_| "sdk".to_string());
 
     let include_path = std::path::PathBuf::from(format!("{sdk_path}/Include"));
 
@@ -13,7 +13,7 @@ fn main() {
         .include("headers/")
         .build("src/lib.rs");
 
-    println!("cargo:rerun-if-env-changed=REDSDK_PATH");
+    println!("cargo:rerun-if-env-changed=R3DSDK_DIR");
     println!("cargo:rerun-if-changed=src/asyncdecoder.rs");
     println!("cargo:rerun-if-changed=src/clip.rs");
     println!("cargo:rerun-if-changed=src/custom_io.rs");
