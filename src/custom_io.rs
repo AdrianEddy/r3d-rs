@@ -89,7 +89,12 @@ impl CustomIO {
         });
         Self { instance, raw }
     }
+    pub fn inner(&self) -> &Box<dyn IoInterface> {
+        &*self.instance
+    }
 }
+unsafe impl Send for CustomIO {}
+
 impl Drop for CustomIO {
     fn drop(&mut self) {
         let ptr = self.raw;
@@ -301,48 +306,55 @@ impl IoInterface for FilesystemIo {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
 use std::sync::Arc;
-struct HandleState<T> {
-    entry: Arc<Mutex<T>>,
+use std::sync::RwLock;
+
+struct HandleState<'a> {
+    entry: Arc<Mutex<dyn ReadSeek + 'a>>,
     size: u64,
 }
 
 /// Read-only IO backed by user-provided homogeneous Read+Seek streams (all T).
-pub struct StreamIo<T: Read + Seek + Send + Sync + 'static> {
+pub struct StreamIo<'a> {
     /// filename -> (stream, filesize)
-    table: HashMap<String, (Arc<Mutex<T>>, u64)>,
+    table: RwLock<HashMap<String, (Arc<Mutex<dyn ReadSeek + 'a>>, u64)>>,
+    filesystem_fallback: bool,
 }
 
-impl<T: Read + Seek + Send + Sync + 'static> StreamIo<T> {
+impl<'a> StreamIo<'a> {
     pub fn new() -> Self {
-        Self { table: HashMap::new() }
+        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: false }
+    }
+
+    pub fn with_filesystem_fallback() -> Self {
+        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: true }
     }
 
     /// Insert/replace one entry.
-    pub fn insert<S: Into<String>>(&mut self, name: S, stream: T, size: u64) {
-        self.table.insert(name.into(), (Arc::new(Mutex::new(stream)), size));
-    }
+    pub fn insert<S: Into<String>, T: Read + Seek + 'a>(&self, name: S, mut stream: T, size: Option<u64>) {
+        let size = size.unwrap_or_else(|| {
+            stream.stream_position().and_then(|cur| {
+                let end = stream.seek(SeekFrom::End(0))?;
+                if cur != end {
+                    stream.seek(SeekFrom::Start(cur))?;
+                }
+                Ok(end)
+            }).unwrap_or_default()
+        });
 
-    /// Batch constructor from an iterator.
-    pub fn from_iter<I, S>(items: I) -> Self
-    where
-        I: IntoIterator<Item = (S, (T, u64))>,
-        S: Into<String>,
-    {
-        let mut map = HashMap::new();
-        for (name, (stream, size)) in items {
-            map.insert(name.into(), (Arc::new(Mutex::new(stream)), size));
-        }
-        Self { table: map }
+        self.table.write().unwrap().insert(name.into(), (Arc::new(Mutex::new(stream)), size));
     }
 
     /// Reinterpret an SDK handle back into our typed Arc<HandleState<T>> (without changing refcount).
-    fn handle_to_arc(handle: Handle) -> Option<Arc<HandleState<T>>> {
+    fn handle_to_arc(handle: Handle) -> Option<Arc<HandleState<'a>>> {
         if handle.is_null() || handle == HANDLE_FALLBACK {
             return None;
         }
         // SAFETY: we created this pointer via Arc::into_raw in `open`, so it’s valid for this T.
-        let arc = unsafe { Arc::from_raw(handle as *const HandleState<T>) };
+        let arc = unsafe { Arc::from_raw(handle as *const HandleState<'a>) };
         // Increase strong count by cloning, then forget the temp to keep original count unchanged.
         let cloned = Arc::clone(&arc);
         std::mem::forget(arc); // keep original alive
@@ -350,17 +362,16 @@ impl<T: Read + Seek + Send + Sync + 'static> StreamIo<T> {
     }
 }
 
-impl<T: Read + Seek + Send + Sync + 'static> IoInterface for StreamIo<T> {
+impl IoInterface for StreamIo<'_> {
     fn open(&self, path: &str, access: FileAccess) -> Handle {
         if access == FileAccess::Write {
             // We only support read; ask SDK to try its own writer.
             return HANDLE_FALLBACK;
         }
-        let (entry, size) = match self.table.get(path) {
-            Some((arc, sz)) => (Arc::clone(arc), *sz),
-            None => return HANDLE_ERROR,
+        let state = match self.table.read().unwrap().get(path) {
+            Some((arc, sz)) => HandleState { entry: Arc::clone(arc), size: *sz },
+            None => return if self.filesystem_fallback { HANDLE_FALLBACK } else { HANDLE_ERROR },
         };
-        let state = HandleState { entry, size };
         // Hand back a stable pointer without Box: store as Arc and leak the raw pointer.
         let arc = Arc::new(state);
         Arc::into_raw(arc) as *mut c_void
@@ -376,7 +387,7 @@ impl<T: Read + Seek + Send + Sync + 'static> IoInterface for StreamIo<T> {
         }
         // SAFETY: reconstruct the Arc from the raw pointer, dropping one strong ref.
         unsafe {
-            let _ = Arc::from_raw(handle as *const HandleState<T>);
+            let _ = Arc::from_raw(handle as *const HandleState);
         }
     }
 
