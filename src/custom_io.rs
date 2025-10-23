@@ -321,16 +321,21 @@ struct HandleState<'a> {
 pub struct StreamIo<'a> {
     /// filename -> (stream, filesize)
     table: RwLock<HashMap<String, (Arc<Mutex<dyn ReadSeek + 'a>>, u64)>>,
+    callback: Option<Box<dyn Fn(&str) -> Option<(Arc<Mutex<dyn ReadSeek + 'a>>, Option<u64>)> + 'a>>,
     filesystem_fallback: bool,
 }
 
 impl<'a> StreamIo<'a> {
     pub fn new() -> Self {
-        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: false }
+        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: false, callback: None }
     }
 
     pub fn with_filesystem_fallback() -> Self {
-        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: true }
+        Self { table: RwLock::new(HashMap::new()), filesystem_fallback: true, callback: None }
+    }
+
+    pub fn set_callback<F>(&mut self, cb: F) where F: Fn(&str) -> Option<(Arc<Mutex<dyn ReadSeek + 'a>>, Option<u64>)> + 'a {
+        self.callback = Some(Box::new(cb));
     }
 
     /// Insert/replace one entry.
@@ -370,7 +375,27 @@ impl IoInterface for StreamIo<'_> {
         }
         let state = match self.table.read().unwrap().get(path) {
             Some((arc, sz)) => HandleState { entry: Arc::clone(arc), size: *sz },
-            None => return if self.filesystem_fallback { HANDLE_FALLBACK } else { HANDLE_ERROR },
+            None => match &self.callback {
+                Some(cb) => {
+                    match cb(path) {
+                        Some((stream, size)) => {
+                            let size = size.unwrap_or_else(|| {
+                                let mut stream = stream.lock().unwrap();
+                                stream.stream_position().and_then(|cur| {
+                                    let end = stream.seek(SeekFrom::End(0))?;
+                                    if cur != end {
+                                        stream.seek(SeekFrom::Start(cur))?;
+                                    }
+                                    Ok(end)
+                                }).unwrap_or_default()
+                            });
+                            HandleState { entry: stream.clone(), size }
+                        },
+                        None => return if self.filesystem_fallback { HANDLE_FALLBACK } else { HANDLE_ERROR },
+                    }
+                }
+                None => return if self.filesystem_fallback { HANDLE_FALLBACK } else { HANDLE_ERROR },
+            }
         };
         // Hand back a stable pointer without Box: store as Arc and leak the raw pointer.
         let arc = Arc::new(state);
