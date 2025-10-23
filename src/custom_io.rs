@@ -72,13 +72,13 @@ pub trait IoInterface {
     fn create_path(&self, path: &str) -> bool;
 }
 
-pub struct CustomIO {
+pub struct CustomIO<'a> {
     #[allow(dead_code)]
-    instance: Box<Box<dyn IoInterface>>,
+    instance: Box<Box<dyn IoInterface + 'a>>,
     raw: *mut c_void,
 }
-impl CustomIO {
-    pub fn install(instance: Box<dyn IoInterface>) -> Self {
+impl<'a> CustomIO<'a> {
+    pub fn install(instance: Box<dyn IoInterface + 'a>) -> Self {
         let mut instance = Box::new(instance);
         let instance_ptr = &mut *instance as *mut _ as *mut c_void;
 
@@ -89,13 +89,13 @@ impl CustomIO {
         });
         Self { instance, raw }
     }
-    pub fn inner(&self) -> &Box<dyn IoInterface> {
+    pub fn inner(&self) -> &Box<dyn IoInterface + 'a> {
         &*self.instance
     }
 }
-unsafe impl Send for CustomIO {}
+unsafe impl Send for CustomIO<'_> {}
 
-impl Drop for CustomIO {
+impl Drop for CustomIO<'_> {
     fn drop(&mut self) {
         let ptr = self.raw;
         cpp!(unsafe [ptr as "RustIO*"] {
