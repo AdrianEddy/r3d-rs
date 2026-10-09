@@ -10,6 +10,13 @@ cpp_class! {
     #[derive(Clone)]
 	pub unsafe struct ImageProcessingSettings as "R3DSDK::ImageProcessingSettings"
 }
+// SAFETY: `Send + Sync`. Every mutator takes `&mut self` (so it cannot run
+// concurrently with shared access); the only `&self` getters are read-only or
+// return immutable slices (`user_curve(&self) -> &[f32]`). `Send` impl'd
+// explicitly (macro elides it); `Sync` auto-derives from the inline storage and
+// is sound under those access rules. Pinned by `assert_impl_all!` in
+// `tests/send_sync_surface.rs`.
+unsafe impl Send for ImageProcessingSettings {}
 
 impl ImageProcessingSettings {
 	// --------------------------------------------------------------------------------
@@ -249,6 +256,11 @@ impl ImageProcessingSettings {
 	pub fn     maskline_adjust(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).MasklineAdjust; }) }
 	pub fn set_maskline_adjust(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).MasklineAdjust = v; }) }
 
+	/// Lens Distortion Correction (IPP2) — full & half res premium decodes only. Offer it only when the
+	/// clip's `RMD_LENS_DISTORTION_CORRECTION` metadata (`lens_distortion_correction`) is non-zero.
+	pub fn     lens_distortion_correction(&self)     -> LensCorrection { unsafe { std::mem::transmute(cpp!([self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).LensDistortionCorrection; })) } }
+	pub fn set_lens_distortion_correction(&mut self, v: LensCorrection) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).LensDistortionCorrection = (R3DSDK::LensCorrection)v; }) }
+
 	/// Check to see if all parameters are within range and clip any that aren't.
 	pub fn check_bounds(&mut self) {
 		cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *"] {
@@ -264,6 +276,10 @@ cpp_class! {
     #[derive(Clone)]
 	pub unsafe struct HdrProcessingSettings as "R3DSDK::HdrProcessingSettings"
 }
+// SAFETY: `Send + Sync`, same rationale as `ImageProcessingSettings` — all
+// mutators `&mut self`, all `&self` getters read-only. `Send` explicit; `Sync`
+// auto-derives from the inline storage.
+unsafe impl Send for HdrProcessingSettings {}
 
 impl HdrProcessingSettings {
     /// HDRx blending algorithm to use
@@ -307,3 +323,164 @@ impl HdrProcessingSettings {
         })
     }
 }
+
+/*
+
+// Settings to process the image with. If these settings are not
+// supplied the decoder will use the clip's default settings.
+struct ImageProcessingSettings
+{
+private:
+	unsigned int reserved1;
+	unsigned int reserved2;
+	bool reserved3;
+	bool reserved4;
+
+public:
+	// *********************************************************************
+	// Color version defaults to the latest and greatest (V3 for the current
+	// SDK release). With the exception of FLUT and Shadow, all image
+	// processing setings are available for both color versions. For older
+	// clips you may want to offer a backwards compatibility decode setting.
+	// To do this set Version to ColorVersion1. FLUT, Shadow, as well as
+	// REDgamma and REDcolor options will not be available with the old color!
+	// Settings out of bounds (see ImageProcessingLimits) will be clipped.
+	// *********************************************************************
+	ColorVersion			Version;					// if ColorVersion1 is set for a ColorVersion2 clip it will be forced to ColorVersion2 etc.
+
+	float					Kelvin;						// Kelvin color temperature for white balance
+	float					Tint;						// Tint for white balance
+
+	float					ExposureCompensation;		// Converted in ColorVersion3 mode.
+	float					GainRed, GainGreen, GainBlue;// Ignored with ColorVersion3 or ColorVersionBC
+	float					Saturation;					// Ignored with ColorVersion3 or ColorVersionBC
+	float					Contrast;					// Ignored with ColorVersion3 or ColorVersionBC
+	float					Brightness;					// Converted in ColorVersion3 mode. Ignored with ColorVersionBC
+	float					DRX;						// Highlight extension control. Ignored for Dragon or Helium clips or in ColorVersion3 & ColorVersionBC modes.
+
+	// See ImageProcessingLimits::ISOList for the valid list of ISO values
+	size_t					ISO;						// will clamp to the nearest valid setting
+	ImageGammaCurve			GammaCurve;					// limited to ImageGammaBT1886 or ImageGammaHDR2084 with ColorVersionBC
+	ImageColorSpace			ColorSpace;					// limited to ImageColorRec709 or ImageColorRec2020 with ColorVersionBC
+
+	// Set all of these fields when GammaCurve is set to ImageGammaCustomPDlog.
+	// Ignored with ColorVersion3 (IPP2) or ColorVersionBC.
+	size_t					CustomPDLogBlackPoint;
+	size_t					CustomPDLogWhitePoint;
+	float					CustomPDLogGamma;
+
+	// User defined 5-point luma spline curve. Each of the 5 points consists of
+	// an X & Y coordinate (0 -- 1) from lower left to upper right. Array
+	// goes: black X, black Y, low X, low Y, mid X, mid Y, high X, high Y, white X, white Y
+	// The curve coordinate values should be constrained in both UI and
+	// generating code so that the x coordinates always lie such that:
+	// black X < low X < mid X < high X < white X. If this is not the case
+	// the curve will default to a straight line (0.0, 0.0, 0.25, 0.25,
+	// 0.50, 0.50, 0.75, 0.75, 1.0, 1.0). Ignored with ColorVersionBC.
+	float					UserCurve[10];				// Luma user curve.
+
+	// Following setting is only used for full res premium decode.
+	// THIS SETTING IS IGNORED IN COLORVERSION3 & COLORVERSIONBC!
+	ImageDetail				Detail;
+
+	// Following is only used for full & half res premium decode.
+	// THIS SETTING IS IGNORED IN COLORVERSION3 & COLORVERSIONBC!
+	ImageOLPFCompensation	OLPFCompensation;
+
+	// Following setting is only used for full res premium decode.
+	// THIS SETTING IS IGNORED IN COLORVERSION3 & COLORVERSIONBC!
+	ImageDenoise			Denoise;
+
+	// Following setting is only used for full & half res premium decode.
+	union
+	{
+		// Dragon Enhanced Blacks -- Legacy pipe and Dragon or newer sensors only.
+		bool				DEB;
+
+		// IPP2 & Broadcast only
+		bool				ChromaNoiseReduction;
+	};
+
+	// Following setting is only used for full & half res premium decode.
+	// Ignored for N-RAW clips.
+	FlashingPixelAdjust		FlashingPixelAdjustment;
+
+	// *********************************************************************
+	// Following settings are only available for ColorVersion2 which was
+	// introduced with R3D SDK 3.0. Not available in IPP2 decode mode.
+	// *********************************************************************
+
+	float					Shadow;						// Ignored with ColorVersion3 & ColorVersionBC.
+	float					FLUT;						// Fine ISO control. Ignored with ColorVersion3 & ColorVersionBC.
+
+	// Red, Green & Blue user defined spline curves. Works the same as the luma UserCurve. Ignored with ColorVersionBC.
+	float					UserCurveRed[10];
+	float					UserCurveGreen[10];
+	float					UserCurveBlue[10];
+
+	// Post lift, gamma & gain for Red, Green and Blue channels.
+	// Ignored with ColorVersion3 & ColorVersionBC.
+	LiftGammaGain			LggRed;
+	LiftGammaGain			LggGreen;
+	LiftGammaGain			LggBlue;
+
+	// *********************************************************************
+	// Following settings are only available for ColorVersion3 (IPP2) which
+	// was instroduced with R3D SDK 7.0. Not available in Legacy decode modes.
+	//
+	//	Primary Raw Development:
+	//	- Kelvin
+	//	- Tint
+	//	- ISO
+	//	- Exposure Adjust
+	//
+	//	Grading:
+	//	- Contrast & Curves
+	//	- CDL
+	//	- 3D LUT
+	//
+	//	Output Transform:
+	//	- Output Tonemap
+	//	- Output Color Space
+	//	- Output Gamma Curve
+	//	- Roll-off selection
+	//	- HDR Mid Gray
+	//	- HDR User Nits limit
+	// *********************************************************************
+
+	ImagePipeline			ImagePipelineMode;
+
+	float					ExposureAdjust;				// also available with ColorVersionBC
+
+	float					CdlSaturation;
+	SlopeOffsetPower		CdlRed;
+	SlopeOffsetPower		CdlGreen;
+	SlopeOffsetPower		CdlBlue;
+	bool					CdlEnabled;
+
+	Handle3DLut				Lut3D;						// NULL if disabled/not set. Value is unique per process and cannot
+														// be saved and then re-used later. Use CreateOrUpdateRmd() for that.
+	bool					Lut3DEnabled;				// defaults to FALSE. Only used if a Lut3D is set.
+
+	ToneMap					OutputToneMap;
+	RollOff					HighlightRollOff;			// No effect when a LOG curve is applied
+	unsigned int			HdrPeakNits;				// HDR2084 only, and HighlightRollOf != RollOff_None
+
+	bool					MasklineAdjust;				// also available with ColorVersionBC, ignored for N-RAW clips
+
+	// Following setting is only used for full & half res premium decode.
+	LensCorrection			LensDistortionCorrection;	// recommend hiding or disabling UI if RMD_LENS_DISTORTION_CORRECTION metadata is 0
+
+	// *********************************************************************
+	// Function definitions
+	// *********************************************************************
+
+	// Sets all fields to their defaults. Keep in mind that you should
+	// load the actual clip settings from metadata before setting up
+	// the User Interface or using these settings to decode a frame!
+	ImageProcessingSettings();
+
+	// Check to see if all parameters are within the proper range and clip any that aren't
+	void CheckBounds();
+};
+ */

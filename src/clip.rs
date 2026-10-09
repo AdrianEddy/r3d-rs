@@ -18,6 +18,15 @@ cpp_class! {
 	/// is in progress.
 	pub unsafe struct Clip as "std::unique_ptr<R3DSDK::Clip>"
 }
+// SAFETY: `Send` only is impl'd here; `Sync` auto-derives from the `cpp_class!`
+// inline `[u8; N]` storage. Soundness rests on Rust's borrow discipline: every
+// call the SDK does not document as thread-safe takes `&mut self` — `LoadFrom`
+// / `Close` (the class doc above), `DecodeAudioBlock` / `DecodeAudio` (marked
+// "*NOT* thread-safe" in `R3DSDK.h`) and the timecode getters (their returned
+// string is only valid until the next call). Every remaining `&self` call is
+// covered by the class's thread-safety guarantee. `assert_impl_all!(Clip: Send,
+// Sync)` in `tests/send_sync_surface.rs` pins this.
+unsafe impl Send for Clip {}
 impl Clip {
     /// Create a new Clip instance. Use this if you do not want to load a clip
 	/// when constructing this class. Use LoadFrom() to load a clip before
@@ -173,25 +182,10 @@ impl Clip {
 	/// Compute total buffer size in bytes for a decode with given clip dimensions, mode and pixel type.
 	/// This mirrors the C++ sample: contiguous data, no extra per-row padding, only 16B buffer-start alignment.
 	pub fn calculate_buffer_size(&self, mode: &VideoDecodeMode, pixel_type: &VideoPixelType) -> RedResult<usize> {
-		let src_width  = self.width() as u32;
-		let src_height = self.height() as u32;
-		let (w, h) = scaled_dims(src_width, src_height, mode);
-		let info = pixel_info(pixel_type);
-
-		let bytes = if info.interleaved {
-			w.checked_mul(h)
-				.and_then(|px| px.checked_mul(info.bpp_or_sample))
-				.unwrap()
-		} else {
-			// planar RGB: channels * (w * h * bytes_per_sample)
-			let per_plane = w.checked_mul(h)
-				.and_then(|px| px.checked_mul(info.bpp_or_sample))
-				.unwrap();
-			per_plane.checked_mul(info.channels)
-				.unwrap()
-		};
-
-		Ok(bytes)
+		let (w, h) = scaled_dims(self.width(), self.height(), *mode);
+		w.checked_mul(h)
+			.and_then(|px| px.checked_mul(bytes_per_pixel(*pixel_type)))
+			.ok_or_else(|| RedError::Other(format!("{w}x{h} {pixel_type:?} frame size overflows usize")))
 	}
 
 	pub fn allocate_aligned_buffer(&self, mode: &VideoDecodeMode, pixel_type: &VideoPixelType, align: usize) -> RedResult<AlignedBuffer> {
@@ -257,6 +251,70 @@ impl Clip {
 
 				Ok(Some(buf))
 			}
+		}
+	}
+
+	/// Decode the audio block `audio_block_no` into `buffer`.
+	///
+	/// `buffer` MUST be 512-byte aligned — allocate it via
+	/// `AlignedBuffer::new(size, 512)` where `size` is at least the maximum
+	/// block size reported by [`Clip::audio_block_count_and_size`] (that value
+	/// is already a multiple of 512). Samples are 24- or 32-bit Big-Endian; for
+	/// 24-bit audio each sample is MSB-aligned in a 32-bit word (low 8 bits
+	/// zero), and multichannel audio is interleaved.
+	///
+	/// A clip without audio reports a maximum block size of 0, and
+	/// `AlignedBuffer::new(0, _)` fails, so check
+	/// [`Clip::audio_channel_count`] first.
+	///
+	/// Returns the number of bytes actually written, always a multiple of
+	/// `4 * audio_channel_count()`. The SDK call is not thread-safe, so this
+	/// takes `&mut self`.
+	pub fn decode_audio_block(&mut self, audio_block_no: usize, buffer: &mut AlignedBuffer) -> RedResult<usize> {
+		if buffer.layout.align() < 512 {
+			return Err(RedError::BufferNotAligned);
+		}
+		let mut buffer_size: usize = buffer.len();
+		let out_ptr = buffer.ptr;
+		let size_ptr = &mut buffer_size as *mut usize;
+		let result: DecodeStatus = unsafe { std::mem::transmute(cpp!([self as "const std::unique_ptr<R3DSDK::Clip> *", audio_block_no as "size_t", out_ptr as "void *", size_ptr as "size_t *"] -> i32 as "int" {
+			return (int)(*self)->DecodeAudioBlock(audio_block_no, out_ptr, size_ptr);
+		})) };
+		match result {
+			DecodeStatus::Ok => Ok(buffer_size),
+			s => Err(s.into()),
+		}
+	}
+
+	/// Decode `num_samples` raw audio samples (expressed *per channel* — do NOT
+	/// multiply by the channel count, the SDK does that) starting at
+	/// `start_sample` into `buffer`.
+	///
+	/// `buffer` MUST be 512-byte aligned — allocate it via
+	/// `AlignedBuffer::new(size, 512)` with room for
+	/// `align_to_512(num_samples * audio_channel_count() * 4)` bytes. Samples
+	/// are 24- or 32-bit Big-Endian, interleaved across channels (see
+	/// [`Clip::decode_audio_block`]). Fewer samples than requested are written
+	/// when `start_sample + num_samples` runs past the end of the clip.
+	///
+	/// Returns the number of bytes actually written, always a multiple of
+	/// `4 * audio_channel_count()`; the per-channel sample count is
+	/// `bytes / (4 * audio_channel_count())`. The SDK call is not thread-safe,
+	/// so this takes `&mut self`.
+	pub fn decode_audio(&mut self, start_sample: u64, num_samples: usize, buffer: &mut AlignedBuffer) -> RedResult<usize> {
+		if buffer.layout.align() < 512 {
+			return Err(RedError::BufferNotAligned);
+		}
+		let mut number_of_samples: usize = num_samples;
+		let buffer_size: usize = buffer.len();
+		let out_ptr = buffer.ptr;
+		let samples_ptr = &mut number_of_samples as *mut usize;
+		let result: DecodeStatus = unsafe { std::mem::transmute(cpp!([self as "const std::unique_ptr<R3DSDK::Clip> *", start_sample as "unsigned long long", samples_ptr as "size_t *", out_ptr as "void *", buffer_size as "size_t"] -> i32 as "int" {
+			return (int)(*self)->DecodeAudio(start_sample, samples_ptr, out_ptr, buffer_size);
+		})) };
+		match result {
+			DecodeStatus::Ok => Ok(number_of_samples * self.audio_channel_count() * 4),
+			s => Err(s.into()),
 		}
 	}
 
@@ -703,6 +761,10 @@ cpp_class! {
 	/// with the exception of 'ImageProcessing' & "HdrProcessing'
 	pub unsafe struct VideoDecodeJob as "R3DSDK::VideoDecodeJob"
 }
+// SAFETY: single-owner job descriptor consumed at submit time; the only `&self`
+// getters are the read-only `cpp_class!` ones. `Send` impl'd explicitly (macro
+// elides it); `Sync` auto-derives from the inline `[u8; N]` storage.
+unsafe impl Send for VideoDecodeJob {}
 impl VideoDecodeJob {
 	/// Resolution/speed to decode the image at. This will also
 	/// influence how much memory is needed for the output buffer
@@ -781,8 +843,11 @@ impl VideoDecodeJob {
 }
 
 
+/// The integer downscale divisor for a [`VideoDecodeMode`]: `1` for full-res,
+/// `2`/`4`/`8`/`16` for the reduced-res modes. The single source for CPU
+/// buffer sizing here and GPU output sizing in `gpu.rs`.
 #[inline]
-fn mode_divisor(mode: &VideoDecodeMode) -> usize {
+pub(crate) const fn mode_divisor(mode: VideoDecodeMode) -> usize {
     match mode {
         VideoDecodeMode::FullResPremium   => 1,
         VideoDecodeMode::HalfResPremium   => 2,
@@ -792,32 +857,26 @@ fn mode_divisor(mode: &VideoDecodeMode) -> usize {
         VideoDecodeMode::SixteenthResGood => 16,
     }
 }
-/// Return the decoded image dimensions *after* the mode scaling.
-fn scaled_dims(src_w: u32, src_h: u32, mode: &VideoDecodeMode) -> (usize, usize) {
+/// Return the decoded image dimensions *after* the mode scaling (integer
+/// division, no rounding).
+pub(crate) const fn scaled_dims(src_w: usize, src_h: usize, mode: VideoDecodeMode) -> (usize, usize) {
 	let div = mode_divisor(mode);
-	(src_w as usize / div, src_h as usize / div)
+	(src_w / div, src_h / div)
 }
 
-#[derive(Clone, Copy)]
-struct PixelInfo {
-    /// bytes per pixel (interleaved) OR bytes per *sample* for planar channels
-    bpp_or_sample: usize,
-    /// number of channels/planes
-    channels: usize,
-    /// true if interleaved RGB(A); false if planar RGB
-    interleaved: bool,
-}
-
-/// Known pixel formats per RED SDK docs in the sample.
-fn pixel_info(pt: &VideoPixelType) -> PixelInfo {
+/// Bytes per pixel across all channels, per the RED SDK docs in the sample.
+/// Planar RGB stores one plane of samples per channel, so a w * h frame is
+/// w * h * bytes_per_pixel for every format. The single source for CPU
+/// buffer sizing here and GPU output sizing in `gpu.rs`.
+pub(crate) const fn bytes_per_pixel(pt: VideoPixelType) -> usize {
     match pt {
-        VideoPixelType::Rgb16bitInterleaved     => PixelInfo { bpp_or_sample: 6, channels: 1, interleaved: true },  // 3 * 16-bit
-        VideoPixelType::RgbHalfFloatInterleaved => PixelInfo { bpp_or_sample: 6, channels: 1, interleaved: true },  // 3 * 16-bit half
-        VideoPixelType::RgbHalfFloatAcesInt     => PixelInfo { bpp_or_sample: 6, channels: 1, interleaved: true },  // 3 * 16-bit half
-        VideoPixelType::Rgb16bitPlanar          => PixelInfo { bpp_or_sample: 2, channels: 3, interleaved: false }, // per-plane sample = 2B
-        VideoPixelType::Bgr8bitInterleaved      => PixelInfo { bpp_or_sample: 3, channels: 1, interleaved: true },  // 3 * 8-bit
-        VideoPixelType::Bgra8bitInterleaved     => PixelInfo { bpp_or_sample: 4, channels: 1, interleaved: true },  // 4 * 8-bit
-        VideoPixelType::Dpx10bitMethodB         => PixelInfo { bpp_or_sample: 4, channels: 1, interleaved: true },  // packed; SDK uses 4B/px
+        VideoPixelType::Rgb16bitInterleaved     => 6, // 3 * 16-bit
+        VideoPixelType::RgbHalfFloatInterleaved => 6, // 3 * 16-bit half
+        VideoPixelType::RgbHalfFloatAcesInt     => 6, // 3 * 16-bit half
+        VideoPixelType::Rgb16bitPlanar          => 6, // 3 planes * 16-bit
+        VideoPixelType::Bgr8bitInterleaved      => 3, // 3 * 8-bit
+        VideoPixelType::Bgra8bitInterleaved     => 4, // 4 * 8-bit
+        VideoPixelType::Dpx10bitMethodB         => 4, // packed; SDK uses 4B/px
     }
 }
 
@@ -825,10 +884,23 @@ pub struct AlignedBuffer {
 	pub ptr: *mut core::ffi::c_void,
 	pub layout: std::alloc::Layout
 }
+// SAFETY: `Send` only — a single-owner heap allocation handed to the SDK once
+// per submission then dropped/recycled. Concurrent `&self` would alias the
+// buffer the SDK writes into, so not `Sync` (pinned negative in
+// `tests/send_sync_surface.rs`).
+unsafe impl Send for AlignedBuffer {}
 
 impl AlignedBuffer {
+	/// Allocate `size` bytes aligned to `alignment` (a power of two).
+	///
+	/// Fails for `size == 0`: a zero-sized allocation is undefined behaviour in
+	/// the global allocator, and an empty buffer would hand the SDK a pointer
+	/// it cannot write through. A size of 0 from the SDK (e.g. the audio block
+	/// size of a clip without audio) means there is nothing to decode.
 	pub fn new(size: usize, alignment: usize) -> RedResult<Self> {
-		println!("Allocating aligned buffer: size={size}, alignment={alignment}");
+		if size == 0 {
+			return Err(RedError::Other("cannot allocate a zero-sized AlignedBuffer".into()));
+		}
 		let layout = std::alloc::Layout::from_size_align(size, alignment)?;
 		let ptr = unsafe { std::alloc::alloc(layout) } as *mut core::ffi::c_void;
 		if ptr.is_null() {
@@ -847,7 +919,6 @@ impl AlignedBuffer {
 }
 impl Drop for AlignedBuffer {
 	fn drop(&mut self) {
-		println!("Deallocating aligned buffer: size={}, alignment={}", self.layout.size(), self.layout.align());
 		unsafe { std::alloc::dealloc(self.ptr as *mut u8, self.layout); }
 	}
 }

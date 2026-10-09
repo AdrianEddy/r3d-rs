@@ -13,6 +13,12 @@ cpp! {{
 pub struct R3dDecoder {
     ptr: *mut core::ffi::c_void
 }
+// SAFETY: `Send + Sync`. `ptr` is an opaque owned `R3DSDK::R3DDecoder *`; the
+// `decode` entry point takes `&self` and is part of the SDK's documented
+// thread-safe decode surface. Pinned by `assert_impl_all!` in
+// `tests/send_sync_surface.rs`.
+unsafe impl Send for R3dDecoder {}
+unsafe impl Sync for R3dDecoder {}
 impl R3dDecoder {
     pub fn new(options: &R3dDecoderOptions) -> RedResult<Self> {
         unsafe {
@@ -43,7 +49,10 @@ impl R3dDecoder {
             let job_ptr = job.ptr;
 
             let state = Arc::new(State::new(job));
-            let state_ptr = Arc::as_ptr(&state) as *mut c_void;
+            // Owned refcount handed to the SDK; reclaimed in `decode_callback`
+            // via `Arc::from_raw`. Keeps `State` + the job alive across an
+            // early future drop (no use-after-free). See `State` docs.
+            let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
 
             let callback_ptr = decode_callback as extern "C" fn(*mut c_void, R3DStatus);
 
@@ -53,6 +62,8 @@ impl R3dDecoder {
                 return ptr->decode(job_ptr);
             }));
             if status != R3DStatus::Ok {
+                // Job never queued → no callback → reclaim to avoid a leak.
+                drop(Arc::from_raw(state_ptr as *const State<R3dDecodeJob>));
                 Err(RedError::from(status))
             } else {
                 Ok(CallbackFuture { state })
@@ -78,8 +89,11 @@ impl Drop for R3dDecoder {
 /// The defaults the SDK chooses are usually core count - 1 for threads, and min(device memory * 0.75, concurrent GPU Frames * 1GB) for GPUs, for host memory the value is by default set to concurrentImageCount * 512MB,
 /// note if the device of the host actually runs out of memory the out of memory status will be returned from either the callback or the decode call, based upon when it occurs.  Memory pools do not pre-allocate the memory.
 pub struct R3dDecoderOptions {
-    ptr: *mut core::ffi::c_void
+    ptr: *mut core::ffi::c_void,
 }
+// SAFETY: `Send` only — owns lane-specific device handles whose concurrent
+// `&self` shareability is not documented by the SDK, so no `Sync`.
+unsafe impl Send for R3dDecoderOptions {}
 impl R3dDecoderOptions {
     pub fn new() -> RedResult<Self> {
         unsafe {
@@ -212,7 +226,6 @@ impl R3dDecoderOptions {
                 }
                 return status;
             }));
-            dbg!(list.len());
             if status != R3DStatus::Ok {
                 Err(RedError::from(status))
             } else {
@@ -275,6 +288,10 @@ impl R3dDecoderOptions {
 cpp_class! {
     pub unsafe struct OpenCLDeviceInfo as "R3DSDK::OpenCLDeviceInfo"
 }
+// SAFETY: SDK-emitted device-enumeration entry — opaque, read-only at the
+// public surface. The `cpp_class!` macro elides auto-`Send`, so add it
+// explicitly; `Sync` falls out of the `[u8; N]` inline storage.
+unsafe impl Send for OpenCLDeviceInfo {}
 impl OpenCLDeviceInfo {
     /// platform_id corresponds to a cl_platform_id which is actually _cl_platform_id *
     /// must be set to choose a specific device.
@@ -321,6 +338,9 @@ impl std::fmt::Debug for OpenCLDeviceInfo {
 cpp_class! {
     pub unsafe struct CudaDeviceInfo as "R3DSDK::CudaDeviceInfo"
 }
+// SAFETY: SDK-emitted device-enumeration entry — opaque, read-only at the
+// public surface. `Send` added explicitly (macro elides it); `Sync` auto.
+unsafe impl Send for CudaDeviceInfo {}
 impl CudaDeviceInfo {
     /// pci_bus_id value must be set to choose a specific device bus id.
     /// pci_bus_id corresponds to the cudaDeviceProp.pciBusID field
@@ -361,6 +381,10 @@ pub struct R3dDecodeJob {
     internal_buffer: Option<AlignedBuffer>,
     metadata_allocated: bool,
 }
+// SAFETY: `Send` only — single-owner cursor-state mutator, consumed once per
+// submission then dropped or recycled. Concurrent `&self` would race the SDK's
+// internal state, so not `Sync` (pinned negative in `tests/send_sync_surface.rs`).
+unsafe impl Send for R3dDecodeJob {}
 impl R3dDecodeJob {
     pub fn new() -> RedResult<Self> {
         unsafe {
@@ -522,19 +546,19 @@ extern "C" fn decode_callback(job: *mut c_void /* R3DDecodeJob * */, decode_stat
         return;
     }
 
-    // Safety: `ud` points to the State inside an Arc held by the Future.
-    let state: &mut State<R3dDecodeJob> = unsafe { &mut *(ud as *mut State<R3dDecodeJob>) };
-
-    // Store the result and signal completion
-    {
-        let mut lock = state.result.lock().unwrap();
-        let org_job = state.job.take().unwrap();
-        if decode_status == R3DStatus::Ok {
-            *lock = Some(Ok(org_job));
-        } else {
-            *lock = Some(Err(RedError::from(decode_status)));
-        }
-    }
+    // Reclaim the owned refcount handed to the SDK at submit time (balances
+    // the `Arc::into_raw` in `decode`). `State` outlives an early future drop,
+    // so the callback never writes into freed memory. The job stays in the
+    // slot for `poll` to return.
+    let state = unsafe { Arc::from_raw(ud as *const State<R3dDecodeJob>) };
+    *state.status.lock().unwrap() = Some(if decode_status == R3DStatus::Ok {
+        Ok(())
+    } else {
+        Err(RedError::from(decode_status))
+    });
     state.done.store(true, Ordering::Release);
     state.waker.wake();
+    // If the future is gone this is the last reference, and dropping it here
+    // would call `ReleaseDecodeJob` on `job` from inside its own callback.
+    release_from_callback(state);
 }

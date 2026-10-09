@@ -168,6 +168,7 @@ pub enum InitializeStatus {
     InternalError = 16,
 
     MetalNotAvailable = 20,
+    CudaNotAvailable = 21,
 }
 
 /// Clip load status
@@ -419,6 +420,18 @@ pub enum RollOff {
     Hard = 1,
     /// advanced option
     None = 0,
+}
+
+/// IPP2 (ColorVersion3) only
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum LensCorrection {
+    /// follow metadata (user has not overridden the setting)
+    Auto = 0,
+    /// force correction on, if correction metadata is present
+    On = 1,
+    /// force correction off
+    Off = 2,
 }
 
 /// IPP2 (ColorVersion3) only

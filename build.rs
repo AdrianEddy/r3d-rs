@@ -14,33 +14,38 @@ fn main() {
         .build("src/lib.rs");
 
     println!("cargo:rerun-if-env-changed=R3DSDK_DIR");
-    println!("cargo:rerun-if-changed=src/asyncdecoder.rs");
-    println!("cargo:rerun-if-changed=src/clip.rs");
-    println!("cargo:rerun-if-changed=src/custom_io.rs");
-    println!("cargo:rerun-if-changed=src/debayer/cuda.rs");
-    println!("cargo:rerun-if-changed=src/debayer/metal.rs");
-    println!("cargo:rerun-if-changed=src/debayer/opencl.rs");
-    println!("cargo:rerun-if-changed=src/image_processing_settings.rs");
-    println!("cargo:rerun-if-changed=src/image_processing_limits.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/metadata.rs");
-    println!("cargo:rerun-if-changed=src/r3ddecoder.rs");
-    println!("cargo:rerun-if-changed=src/sdk.rs");
+    println!("cargo:rerun-if-changed={sdk_path}/Include");
+    // Every module may hold `cpp!` blocks the build compiles, so any source change reruns it.
+    println!("cargo:rerun-if-changed=src");
 
     println!("cargo:rustc-include-search={sdk_path}/Include");
     println!("cargo:rustc-include-search=headers/");
 
-    if cfg!(feature = "link") {
-        if cfg!(target_os = "windows") {
-            println!("cargo:rustc-link-search={sdk_path}/Lib/win64");
-            println!("cargo:rustc-link-lib=R3DSDK-2017MD");
-        } else if cfg!(target_os = "macos") {
-            println!("cargo:rustc-link-search={sdk_path}/Lib/mac64");
-            println!("cargo:rustc-link-lib=R3DSDK-libcpp");
-            println!("cargo:rustc-link-lib=framework=Metal");
-        } else if cfg!(target_os = "linux") {
-            println!("cargo:rustc-link-search={sdk_path}/Lib/linux64");
-            println!("cargo:rustc-link-lib=R3DSDKPIC-cpp11");
+    // A build script runs on the host, so the target comes from Cargo's
+    // `CARGO_CFG_*` variables, not from `cfg!`.
+    if std::env::var_os("CARGO_FEATURE_LINK").is_some() {
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        match (target_os.as_str(), target_arch.as_str()) {
+            ("windows", "aarch64") => {
+                // The ARM64 SDK ships only Visual Studio 2022 builds.
+                println!("cargo:rustc-link-search={sdk_path}/Lib/winarm64");
+                println!("cargo:rustc-link-lib=R3DSDK-2022MD");
+            }
+            ("windows", _) => {
+                println!("cargo:rustc-link-search={sdk_path}/Lib/win64");
+                println!("cargo:rustc-link-lib=R3DSDK-2017MD");
+            }
+            ("macos", _) => {
+                println!("cargo:rustc-link-search={sdk_path}/Lib/mac64");
+                println!("cargo:rustc-link-lib=R3DSDK-libcpp");
+                println!("cargo:rustc-link-lib=framework=Metal");
+            }
+            ("linux", _) => {
+                println!("cargo:rustc-link-search={sdk_path}/Lib/linux64");
+                println!("cargo:rustc-link-lib=R3DSDKPIC-cpp11");
+            }
+            _ => {}
         }
     }
 }

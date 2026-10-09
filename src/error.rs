@@ -27,6 +27,7 @@ pub enum RedError {
     InvalidPath,
     InternalError,
     MetalNotAvailable,
+    CudaNotAvailable,
 
     // Clip errors
     ClipPathNotFound,
@@ -117,6 +118,7 @@ impl std::fmt::Display for RedError {
             Self::InvalidPath                       => write!(f, "Invalid path"),
             Self::InternalError                     => write!(f, "Internal error"),
             Self::MetalNotAvailable                 => write!(f, "Metal not available"),
+            Self::CudaNotAvailable                  => write!(f, "CUDA not available"),
 
             Self::ClipPathNotFound                  => write!(f, "Clip path not found"),
             Self::ClipFailedToOpenFile              => write!(f, "Clip failed to open file"),
@@ -196,6 +198,7 @@ impl From<InitializeStatus> for RedError {
             InitializeStatus::InvalidPath                       => Self::InvalidPath,
             InitializeStatus::InternalError                     => Self::InternalError,
             InitializeStatus::MetalNotAvailable                 => Self::MetalNotAvailable,
+            InitializeStatus::CudaNotAvailable                  => Self::CudaNotAvailable,
             InitializeStatus::Ok                                => panic!("Cannot convert ISInitializeOK to RedError"),
         }
     }

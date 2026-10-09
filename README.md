@@ -16,9 +16,9 @@ Safe, ergonomic, and async-first Rust bindings for **R3D RAW SDK**.
 * **Idiomatic iterators & enums**.
 * **Async runtime agnostic**: works with any executor; use `pollster` to block when you want simplicity.
 * **Native docs**: all structs and enums are documented based on the official SDK documentation
-* **Cross-platform**: Windows, Linux, macOS.
+* **Cross-platform**: Windows (x64 and ARM64), Linux, macOS.
 
-**Based on R3D RAW SDK 9.1.0**.
+**Based on R3D RAW SDK 9.2.1**.
 
 ---
 
@@ -142,6 +142,11 @@ fn main() -> Result<(), RedError> {
 
 This crate **requires the R3D SDK libraries at build time** to be able to link them when compiling.
 Set `R3DSDK_DIR` to the SDK root dir
+
+At runtime, `Sdk::initialize` loads the redistributable libraries from the directory it is given:
+`*-x64.dll` on Windows x64, `*-a64.dll` on Windows ARM64. The ARM64 SDK (9.2) supports CPU decoding
+and OpenCL processing only — requesting `InitializeFlags::Cuda` there fails with
+`RedError::CudaNotAvailable`.
 
 If you prefer to link the libraries yourself, add `default-features = false` to your Cargo.toml
 

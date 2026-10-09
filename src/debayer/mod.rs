@@ -13,3 +13,5 @@ pub use cuda::*;
 mod metal;
 #[cfg(feature = "metal-debayer")]
 pub use metal::*;
+#[cfg(feature = "metal-debayer")]
+pub(crate) use metal::{ new_managed_buffer, write_managed_buffer, release_buffer };

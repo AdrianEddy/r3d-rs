@@ -16,15 +16,16 @@ link = []
 metal-debayer = []
 
 [dependencies]
-bitflags = "2.9"
+bitflags = "2.13"
 cpp = "0.5"
 futures-util = "0.3"
 log = "0.4"
-libloading = "0.8"
+libloading = "0.9"
+pollster = "1.0"
 
 [build-dependencies]
 cpp_build = "0.5"
 
 [dev-dependencies]
 image = "0.25"
-pollster = "0.4"
+static_assertions = "1.1"

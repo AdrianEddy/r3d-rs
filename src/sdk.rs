@@ -64,6 +64,9 @@ impl Sdk {
 
 impl Drop for Sdk {
     fn drop(&mut self) {
+        // Jobs whose futures were dropped early are released on a reaper
+        // thread; finish those releases while the SDK is still loaded.
+        crate::future::flush_deferred_drops();
         cpp!(unsafe []  { R3DSDK::FinalizeSdk(); })
     }
 }

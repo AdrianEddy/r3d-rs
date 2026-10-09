@@ -14,6 +14,13 @@ cpp!{{
 pub struct AsyncDecoder {
     ptr: *mut core::ffi::c_void,
 }
+// SAFETY: `Send + Sync`. `ptr` is an opaque owned `R3DSDK::AsyncDecoder *`
+// with no thread affinity, and `decode_for_gpu_sdk` is part of the SDK's
+// documented thread-safe decode surface (the lane debayers' `process_blocking`
+// is documented "Thread safe blocking call"). Pinned by `assert_impl_all!` in
+// `tests/send_sync_surface.rs`.
+unsafe impl Send for AsyncDecoder {}
+unsafe impl Sync for AsyncDecoder {}
 
 impl AsyncDecoder {
 	/// Create and open the asynchronous decoder with the specified number of threads
@@ -61,7 +68,12 @@ impl AsyncDecoder {
             let job_ptr = job.as_mut_ptr();
 
             let state = Arc::new(State::new(job));
-            let state_ptr = Arc::as_ptr(&state) as *mut c_void;
+            // Hand the SDK an *owned* refcount (reclaimed in the callback via
+            // `Arc::from_raw`). This keeps `State` — and the job + output
+            // buffer it holds — alive even if the caller drops the future
+            // before the callback fires; otherwise the SDK would write into
+            // freed memory. See `State` docs.
+            let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
 
             let callback_ptr = async_decode_callback as extern "C" fn(*mut c_void, DecodeStatus);
 
@@ -71,6 +83,9 @@ impl AsyncDecoder {
                 return ptr->DecodeForGpuSdk(*job_ptr);
             }));
             if status != DecodeStatus::Ok {
+                // The job was never queued, so the callback will not fire —
+                // reclaim the refcount we handed the SDK to avoid a leak.
+                drop(Arc::from_raw(state_ptr as *const State<AsyncDecompressJob>));
                 Err(RedError::from(status))
             } else {
                 Ok(CallbackFuture { state })
@@ -94,6 +109,10 @@ impl Drop for AsyncDecoder {
 pub struct GpuDecoder {
     ptr: *mut core::ffi::c_void,
 }
+// SAFETY: `Send + Sync`, same rationale as `AsyncDecoder` above — opaque owned
+// handle, `&self` decode entry point on the documented thread-safe surface.
+unsafe impl Send for GpuDecoder {}
+unsafe impl Sync for GpuDecoder {}
 
 impl GpuDecoder {
 	/// Create and open the asynchronous decoder.
@@ -145,7 +164,10 @@ impl GpuDecoder {
             let job_ptr = job.as_mut_ptr();
 
             let state = Arc::new(State::new(job));
-            let state_ptr = Arc::as_ptr(&state) as *mut c_void;
+            // Owned refcount handed to the SDK; reclaimed in the callback via
+            // `Arc::from_raw`. Keeps `State` + the job/output buffer alive
+            // across an early future drop — see `State` docs.
+            let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
 
             let callback_ptr = async_decode_callback as extern "C" fn(*mut c_void, DecodeStatus);
 
@@ -155,6 +177,8 @@ impl GpuDecoder {
                 return ptr->DecodeForGpuSdk(*job_ptr);
             }));
             if status != DecodeStatus::Ok {
+                // Job never queued → no callback → reclaim to avoid a leak.
+                drop(Arc::from_raw(state_ptr as *const State<AsyncDecompressJob>));
                 Err(RedError::from(status))
             } else {
                 Ok(CallbackFuture { state })
@@ -177,6 +201,11 @@ pub struct AsyncDecompressJob {
     internal_buffer: Option<AlignedBuffer>,
     metadata_allocated: bool,
 }
+// SAFETY: `Send` only — a single-owner cursor-state mutator, consumed once per
+// submission then dropped or recycled by the caller. Concurrent `&self` access
+// would race the SDK's internal job state, so it is deliberately not `Sync`
+// (pinned negative in `tests/send_sync_surface.rs`).
+unsafe impl Send for AsyncDecompressJob {}
 impl AsyncDecompressJob {
     pub fn new() -> Self {
         unsafe {
@@ -267,11 +296,38 @@ impl AsyncDecompressJob {
     /// Always aligned to 1024 bytes.
 	pub fn allocate_internal_buffer(&mut self) -> RedResult<()> {
         let size = AsyncDecoder::size_buffer_needed(self);
-        self.internal_buffer = Some(AlignedBuffer::new(size, 16)?);
-        let buf = self.internal_buffer.as_ref().unwrap();
-        self.set_output_buffer(buf.ptr, buf.len());
+        self.set_internal_buffer(AlignedBuffer::new(size, 16)?);
         Ok(())
 	}
+
+    /// Give the job ownership of `buf` and point the output buffer at it,
+    /// replacing any previous internal buffer. `buf` must be 16-byte aligned
+    /// and at least as large as the decoder's `size_buffer_needed`.
+    ///
+    /// Unlike [`set_output_buffer`](Self::set_output_buffer), the buffer then
+    /// lives exactly as long as the job. A submitted job is co-owned by the
+    /// SDK until its completion callback, so the SDK can never write into a
+    /// buffer that was freed under it.
+    pub fn set_internal_buffer(&mut self, buf: AlignedBuffer) {
+        self.set_output_buffer(buf.ptr, buf.len());
+        self.internal_buffer = Some(buf);
+    }
+
+    /// The buffer set by [`set_internal_buffer`](Self::set_internal_buffer)
+    /// or [`allocate_internal_buffer`](Self::allocate_internal_buffer).
+    pub fn internal_buffer(&self) -> Option<&AlignedBuffer> {
+        self.internal_buffer.as_ref()
+    }
+
+    /// Take the internal buffer back out of the job (e.g. to recycle it) and
+    /// clear the job's output buffer pointer.
+    pub fn take_internal_buffer(&mut self) -> Option<AlignedBuffer> {
+        let buf = self.internal_buffer.take();
+        if buf.is_some() {
+            self.set_output_buffer(core::ptr::null_mut(), 0);
+        }
+        buf
+    }
 
 	/// Allocate internal metadata object to receive per-frame metadata.
     /// Call this before submitting the job if you want to receive metadata.
@@ -312,19 +368,37 @@ extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */,
         return;
     }
 
-    // Safety: `ud` points to the State inside an Arc held by the Future.
-    let state: &mut State<AsyncDecompressJob> = unsafe { &mut *(ud as *mut State<AsyncDecompressJob>) };
-
-    // Store the result and signal completion
-    {
-        let mut lock = state.result.lock().unwrap();
-        let org_job = state.job.take().unwrap();
-        if decode_status == DecodeStatus::Ok {
-            *lock = Some(Ok(org_job));
-        } else {
-            *lock = Some(Err(RedError::from(decode_status)));
-        }
-    }
+    // Reclaim the owned refcount handed to the SDK at submit time. `State` is
+    // freed only once the future's clone is also gone, so a future dropped
+    // before this point does not cause a use-after-free. The job stays in the
+    // slot — `poll` hands it back; we only record the status here.
+    let state = unsafe { Arc::from_raw(ud as *const State<AsyncDecompressJob>) };
+    *state.status.lock().unwrap() = Some(if decode_status == DecodeStatus::Ok {
+        Ok(())
+    } else {
+        Err(RedError::from(decode_status))
+    });
     state.done.store(true, Ordering::Release);
     state.waker.wake();
+    // If the future is gone this is the last reference, and dropping it here
+    // would delete `job` while the SDK is still inside its callback.
+    release_from_callback(state);
+}
+
+impl CallbackFuture<AsyncDecompressJob> {
+    /// Request the SDK abort this in-flight decode as soon as possible
+    /// (sets `AsyncDecompressJob::AbortDecode`).
+    ///
+    /// The SDK still delivers exactly one completion callback per submitted
+    /// job — an aborted frame completes with [`DecodeStatus::Cancelled`] —
+    /// so after `abort()` you must still drive the future to completion
+    /// (await it). **Do not** just drop the future: dropping is memory-safe
+    /// (the SDK co-owns the `State`), but the decode keeps running until it
+    /// finishes or notices the flag, so awaiting is how you reclaim the slot
+    /// promptly. No-op if the result has already been observed.
+    pub fn abort(&self) {
+        if let Some(job) = self.state.job.lock().unwrap().as_mut() {
+            job.abort();
+        }
+    }
 }

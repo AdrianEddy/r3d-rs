@@ -18,6 +18,14 @@ pub type CudaStream = *mut c_void;
 pub struct RedCuda {
     ptr: *mut c_void,
 }
+// SAFETY: `Send + Sync`. The SDK header documents this lane debayer's
+// `process_blocking` as a "Thread safe blocking call" (see below); `ptr` is an
+// opaque owned `R3DSDK::REDCuda *` with no thread affinity. The CUDA "set the
+// device on the calling thread" requirement is a call-site contract on
+// `process_blocking`, not an object-ownership constraint. (No `#[cfg]` needed —
+// this whole module is gated `not(target_os = "macos")` in `debayer/mod.rs`.)
+unsafe impl Send for RedCuda {}
+unsafe impl Sync for RedCuda {}
 
 impl RedCuda {
     /// Create REDCuda wrapper and bind cudart functions dynamically
@@ -146,6 +154,10 @@ pub struct DebayerCudaJob {
     ptr: *mut c_void,   // R3DSDK::DebayerCudaJob *
     owner: *mut c_void, // R3DSDK::REDCuda *
 }
+// SAFETY: `Send` only — single-owner cursor-state mutator consumed once per
+// submission. Concurrent `&self` would race the SDK's internal state, so not
+// `Sync` (pinned negative in `tests/send_sync_surface.rs`).
+unsafe impl Send for DebayerCudaJob {}
 
 impl DebayerCudaJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
@@ -351,7 +363,15 @@ pub struct CudaFunctions {
     pub cudaMallocHost:           dl::Symbol<unsafe extern "C" fn(ptr: *mut *mut ::core::ffi::c_void, size: usize) -> cudaError_t>,
     pub cudaMallocMipmappedArray: dl::Symbol<unsafe extern "C" fn(mipmappedArray: *mut cudaMipmappedArray_t, desc: *const cudaChannelFormatDesc, extent: cudaExtent, numLevels: ::core::ffi::c_uint, flags: ::core::ffi::c_uint) -> cudaError_t>,
     pub cudaMallocPitch:          dl::Symbol<unsafe extern "C" fn(devPtr: *mut *mut ::core::ffi::c_void, pitch: *mut usize, width: usize, height: usize) -> cudaError_t>,
+    pub cudaStreamCreate:         dl::Symbol<unsafe extern "C" fn(pStream: *mut *mut ::core::ffi::c_void) -> cudaError_t>,
+    pub cudaStreamDestroy:        dl::Symbol<unsafe extern "C" fn(stream: *mut ::core::ffi::c_void) -> cudaError_t>,
+    pub cudaMemcpyAsync:          dl::Symbol<unsafe extern "C" fn(dst: *mut ::core::ffi::c_void, src: *const ::core::ffi::c_void, count: usize, kind: cudaMemcpyKind, stream: *mut ::core::ffi::c_void) -> cudaError_t>,
+    pub cudaStreamSynchronize:    dl::Symbol<unsafe extern "C" fn(stream: *mut ::core::ffi::c_void) -> cudaError_t>,
 }
+
+pub type cudaMemcpyKind = i32;
+/// `cudaMemcpyHostToDevice`
+pub const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 
 impl CudaFunctions {
     pub unsafe fn new() -> Result<Self, libloading::Error> {
@@ -400,6 +420,10 @@ impl CudaFunctions {
                 cudaMallocHost:           cudart.get(b"cudaMallocHost")?,
                 cudaMallocMipmappedArray: cudart.get(b"cudaMallocMipmappedArray")?,
                 cudaMallocPitch:          cudart.get(b"cudaMallocPitch")?,
+                cudaStreamCreate:         cudart.get(b"cudaStreamCreate")?,
+                cudaStreamDestroy:        cudart.get(b"cudaStreamDestroy")?,
+                cudaMemcpyAsync:          cudart.get(b"cudaMemcpyAsync")?,
+                cudaStreamSynchronize:    cudart.get(b"cudaStreamSynchronize")?,
 
                 _cudart: cudart,
             })

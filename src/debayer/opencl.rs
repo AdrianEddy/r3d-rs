@@ -15,6 +15,11 @@ cpp!{{
 pub struct RedOpenCl {
     ptr: *mut c_void, // R3DSDK::REDCL *
 }
+// SAFETY: `Send + Sync`. The SDK header documents this lane debayer's
+// `process_blocking` as a "Thread safe blocking call" (see below); `ptr` is an
+// opaque owned `R3DSDK::REDCL *` with no thread affinity.
+unsafe impl Send for RedOpenCl {}
+unsafe impl Sync for RedOpenCl {}
 
 impl RedOpenCl {
     /// compiled_kernel_cache_folder is a folder path to where you want us to store and
@@ -247,6 +252,10 @@ pub struct DebayerOpenCLJob {
     ptr: *mut c_void,   // R3DSDK::DebayerOpenCLJob *
     owner: *mut c_void, // R3DSDK::REDCL *
 }
+// SAFETY: `Send` only — single-owner cursor-state mutator consumed once per
+// submission. Concurrent `&self` would race the SDK's internal state, so not
+// `Sync` (pinned negative in `tests/send_sync_surface.rs`).
+unsafe impl Send for DebayerOpenCLJob {}
 
 impl DebayerOpenCLJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }

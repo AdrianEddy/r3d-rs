@@ -28,6 +28,10 @@ impl std::fmt::Display for Value {
 cpp_class! {
 	pub unsafe struct Metadata as "R3DSDK::Metadata"
 }
+// SAFETY: opaque SDK state; the public surface is read-only queries (`count`,
+// `exists`, `get`) — all `&self`. `Send` impl'd explicitly (macro elides it);
+// `Sync` auto-derives from the inline `[u8; N]` storage.
+unsafe impl Send for Metadata {}
 
 impl Metadata {
     pub fn count(&self) -> usize {

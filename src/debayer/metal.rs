@@ -10,11 +10,76 @@ use core::ffi::c_void;
 
 cpp!{{
     #include "R3DSDKMetal.h"
+    #include <cstring>
+
+    // Owned (+1) `id<MTLBuffer>` handles passed to Rust as `void *`; see
+    // `new_managed_buffer` / `write_managed_buffer` / `release_buffer` below.
+    static void * r3drs_new_managed_buffer(id<MTLCommandQueue> queue, size_t size) {
+        id<MTLBuffer> buffer = [[queue device] newBufferWithLength:size options:MTLResourceStorageModeManaged];
+    #if __has_feature(objc_arc)
+        return (__bridge_retained void *)buffer;
+    #else
+        return (void *)buffer; // `new…` already returns a +1 reference
+    #endif
+    }
+    static void r3drs_write_managed_buffer(void * handle, const void * src, size_t len) {
+    #if __has_feature(objc_arc)
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    #else
+        id<MTLBuffer> buffer = (id<MTLBuffer>)handle;
+    #endif
+        memcpy([buffer contents], src, len);
+        [buffer didModifyRange:NSMakeRange(0, len)];
+    }
+    static void r3drs_release_buffer(void * handle) {
+        if (handle) CFRelease(handle);
+    }
 }}
+
+/// Allocate a `MTLResourceStorageModeManaged` `MTLBuffer` of `size` bytes on
+/// the device that owns `queue` (an `id<MTLCommandQueue>`), as RED's Metal
+/// samples do for `raw_device_mem`. Returns an owned (+1) `id<MTLBuffer>` to
+/// free with [`release_buffer`], or null if Metal could not allocate it.
+pub(crate) fn new_managed_buffer(queue: *mut c_void, size: usize) -> *mut c_void {
+    cpp!(unsafe [queue as "id<MTLCommandQueue>", size as "size_t"] -> *mut c_void as "void *" {
+        return r3drs_new_managed_buffer(queue, size);
+    })
+}
+
+/// Copy `len` bytes from `src` into a managed `MTLBuffer` and flag the range
+/// as modified so Metal synchronises it to the GPU.
+///
+/// # Safety
+/// `buffer` must come from [`new_managed_buffer`] with a size of at least
+/// `len`, `src` must be readable for `len` bytes, and no GPU work may be
+/// using `buffer`.
+pub(crate) unsafe fn write_managed_buffer(buffer: *mut c_void, src: *const c_void, len: usize) {
+    cpp!(unsafe [buffer as "void *", src as "const void *", len as "size_t"] {
+        r3drs_write_managed_buffer(buffer, src, len);
+    })
+}
+
+/// Release a buffer from [`new_managed_buffer`].
+///
+/// # Safety
+/// `buffer` must be an owned handle from [`new_managed_buffer`] that no GPU
+/// work is still using, and must not be used afterwards.
+pub(crate) unsafe fn release_buffer(buffer: *mut c_void) {
+    cpp!(unsafe [buffer as "void *"] {
+        r3drs_release_buffer(buffer);
+    })
+}
 
 pub struct RedMetal {
     ptr: *mut c_void,
 }
+// SAFETY: `Send + Sync`. The SDK header documents this lane debayer's
+// `process_blocking` as a "Thread safe blocking call" (see below); `ptr` is an
+// opaque owned `R3DSDK::REDMetal *` with no thread affinity. (No `#[cfg]`
+// needed — this whole module is gated `feature = "metal-debayer"` in
+// `debayer/mod.rs`.)
+unsafe impl Send for RedMetal {}
+unsafe impl Sync for RedMetal {}
 
 impl RedMetal {
     /// Create REDMetal wrapper
@@ -120,6 +185,10 @@ pub struct DebayerMetalJob {
     ptr: *mut c_void,   // R3DSDK::DebayerMetalJob *
     owner: *mut c_void, // R3DSDK::REDMetal *
 }
+// SAFETY: `Send` only — single-owner cursor-state mutator consumed once per
+// submission. Concurrent `&self` would race the SDK's internal state, so not
+// `Sync` (pinned negative in `tests/send_sync_surface.rs`).
+unsafe impl Send for DebayerMetalJob {}
 
 impl DebayerMetalJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
