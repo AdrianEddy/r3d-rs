@@ -6,21 +6,11 @@
 //! `LensDistortionCorrection` field — the last one in the struct — and check its
 //! neighbours keep their values.
 
-use r3d_rs::{ImageProcessingSettings, InitializeFlags, LensCorrection, Sdk};
+use r3d_rs::{ImageProcessingSettings, LensCorrection};
 
-#[cfg(target_os = "windows")]
-const REDIST_SUBDIR: &str = "sdk/Redistributable/win";
-#[cfg(target_os = "macos")]
-const REDIST_SUBDIR: &str = "sdk/Redistributable/mac";
-#[cfg(target_os = "linux")]
-const REDIST_SUBDIR: &str = "sdk/Redistributable/linux";
-
+/// The settings are plain data, usable without the SDK loaded.
 #[test]
 fn lens_distortion_correction_round_trips() {
-    // The SDK must be initialised before any of its classes is constructed.
-    let _sdk = Sdk::initialize(&format!("{}/{}", env!("CARGO_MANIFEST_DIR"), REDIST_SUBDIR), InitializeFlags::None)
-        .expect("R3D SDK init from bundled redistributable dir");
-
     let mut settings = ImageProcessingSettings::default();
     assert_eq!(settings.lens_distortion_correction(), LensCorrection::Auto, "defaults to following the clip's metadata");
     let (maskline, peak_nits) = (settings.maskline_adjust(), settings.hdr_peak_nits());

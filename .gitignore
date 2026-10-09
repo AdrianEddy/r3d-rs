@@ -1,4 +1,9 @@
-debug
-target
-sdk
+/target
 Cargo.lock
+
+# Local copies of the R3D SDK (proprietary, not redistributable)
+/sdk*/
+
+# Editor settings
+.vscode/
+.idea/

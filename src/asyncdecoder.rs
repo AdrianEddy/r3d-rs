@@ -1,104 +1,112 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-use crate::{ RedResult, RedError,  clip::AlignedBuffer, enums::*, future::*, metadata::* };
+use crate::{ RedResult, RedError, Sdk, clip::{ AlignedBuffer, Clip }, enums::*, future::*, metadata::* };
+use crate::ffi::{ check_status, enum_from_sdk };
 use core::ffi::c_void;
 use std::sync::{ Arc, atomic::Ordering };
 use cpp::*;
 
 cpp!{{
-	#include "R3DSDK.h"
+    #include "R3DSDK.h"
 }}
+
+/// An opened `R3DSDK::AsyncDecoder`. Shared with the jobs in flight on it, so
+/// it is only closed once none is left.
+struct AsyncDecoderInner {
+    ptr: *mut c_void,
+    _sdk: Sdk,
+}
+// SAFETY: `ptr` is an opaque owned `R3DSDK::AsyncDecoder *` with no thread
+// affinity; it is only used for the thread-safe `DecodeForGpuSdk` and on drop.
+unsafe impl Send for AsyncDecoderInner {}
+unsafe impl Sync for AsyncDecoderInner {}
+impl Drop for AsyncDecoderInner {
+    fn drop(&mut self) {
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::AsyncDecoder *"] {
+            ptr->Close();
+            delete ptr;
+        });
+    }
+}
 
 /// Class for asynchronously decompressing a frame for further processing on the GPU.
 pub struct AsyncDecoder {
-    ptr: *mut core::ffi::c_void,
+    inner: Arc<AsyncDecoderInner>,
 }
-// SAFETY: `Send + Sync`. `ptr` is an opaque owned `R3DSDK::AsyncDecoder *`
-// with no thread affinity, and `decode_for_gpu_sdk` is part of the SDK's
-// documented thread-safe decode surface (the lane debayers' `process_blocking`
-// is documented "Thread safe blocking call"). Pinned by `assert_impl_all!` in
-// `tests/send_sync_surface.rs`.
-unsafe impl Send for AsyncDecoder {}
-unsafe impl Sync for AsyncDecoder {}
 
 impl AsyncDecoder {
-	/// Create and open the asynchronous decoder with the specified number of threads
-	/// If threads_no is set to 0, threads_available() number of threads will be used.
-    pub fn new(threads_no: usize) -> Self {
-        let ptr = cpp!(unsafe [threads_no as "size_t"] -> *mut core::ffi::c_void as "R3DSDK::AsyncDecoder *" {
+    /// Create and open the asynchronous decoder with the specified number of threads.
+    /// If `threads_no` is 0, [`threads_available`](AsyncDecoder::threads_available) threads will be used.
+    pub fn new(sdk: &Sdk, threads_no: usize) -> Self {
+        let ptr = cpp!(unsafe [threads_no as "size_t"] -> *mut c_void as "R3DSDK::AsyncDecoder *" {
             R3DSDK::AsyncDecoder *ptr = new R3DSDK::AsyncDecoder();
             ptr->Open(threads_no);
             return ptr;
         });
-        Self { ptr }
+        Self { inner: Arc::new(AsyncDecoderInner { ptr, _sdk: sdk.clone() }) }
     }
-    pub fn as_mut_ptr(&self) -> *mut core::ffi::c_void {
-        self.ptr
+    /// Pointer to the underlying `R3DSDK::AsyncDecoder`.
+    pub fn as_mut_ptr(&self) -> *mut c_void {
+        self.inner.ptr
     }
 
-	/// Returns the number of threads the decoder will use if opened when
-	/// noOfThreads in Open() is set to 0 (the default).
-    pub fn threads_available() -> usize {
+    /// Returns the number of threads the decoder will use when created with
+    /// `threads_no` set to 0.
+    pub fn threads_available(_sdk: &Sdk) -> usize {
         cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::AsyncDecoder::ThreadsAvailable(); })
     }
 
-	/// Returns the size OutputBufferSize needs to be in the AsyncDecompressJob
-	/// so the appropriate size input buffer can be allocated before calling
-	/// the DecodeForGpuSdk() function. The following must be set on input:
-	///  1) job.Clip must point to an open Clip and cannot be NULL
-	///  2) job.Mode must be set appropriately
+    /// Returns the size the output buffer of the [`AsyncDecompressJob`] needs
+    /// to be, so the appropriate size buffer can be allocated before calling
+    /// [`decode_for_gpu_sdk`](AsyncDecoder::decode_for_gpu_sdk). The following must be set on input:
+    ///  1) the job's clip must be set to an open [`Clip`]
+    ///  2) the job's mode must be set appropriately
     ///
-	/// returns 0 if these input parameters are invalid or no clip is loaded
+    /// Returns 0 if these input parameters are invalid or no clip is loaded.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
+        // The SDK requires the job's clip to be set.
+        if job.clip.is_none() {
+            return 0;
+        }
         let job_ptr = job.as_mut_ptr();
         cpp!(unsafe [job_ptr as "const R3DSDK::AsyncDecompressJob *"] -> usize as "size_t" {
             return R3DSDK::AsyncDecoder::GetSizeBufferNeeded(*job_ptr);
         })
     }
 
-	/// Decompress a frame in to the supplied OutputBuffer for further processing on the GPU.
+    /// Decompress a frame in to the job's output buffer for further processing on the GPU.
     /// The decompress will be scheduled and the function will immediately return a future.
     ///
     /// You should await the returned future to get the status of the decompress operation.
     /// The future gives you back ownership of the job you passed in, so you can re-use it if needed.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
-        unsafe {
-            let ptr = self.ptr;
-            let job_ptr = job.as_mut_ptr();
-
-            let state = Arc::new(State::new(job));
-            // Hand the SDK an *owned* refcount (reclaimed in the callback via
-            // `Arc::from_raw`). This keeps `State` — and the job + output
-            // buffer it holds — alive even if the caller drops the future
-            // before the callback fires; otherwise the SDK would write into
-            // freed memory. See `State` docs.
-            let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
-
-            let callback_ptr = async_decode_callback as extern "C" fn(*mut c_void, DecodeStatus);
-
-            let status: DecodeStatus = std::mem::transmute(cpp!([ptr as "R3DSDK::AsyncDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
+        let ptr = self.inner.ptr;
+        submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
+            cpp!(unsafe [ptr as "R3DSDK::AsyncDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
                 job_ptr->Callback = (R3DSDK::AsyncDecompressJob::AsyncDecompressCallback)callback_ptr;
                 job_ptr->PrivateData = state_ptr;
                 return ptr->DecodeForGpuSdk(*job_ptr);
-            }));
-            if status != DecodeStatus::Ok {
-                // The job was never queued, so the callback will not fire —
-                // reclaim the refcount we handed the SDK to avoid a leak.
-                drop(Arc::from_raw(state_ptr as *const State<AsyncDecompressJob>));
-                Err(RedError::from(status))
-            } else {
-                Ok(CallbackFuture { state })
-            }
-        }
+            })
+        })
     }
 }
-impl Drop for AsyncDecoder {
+
+/// An opened `R3DSDK::GpuDecoder`, shared like [`AsyncDecoderInner`].
+struct GpuDecoderInner {
+    ptr: *mut c_void,
+    _sdk: Sdk,
+}
+// SAFETY: same as `AsyncDecoderInner`.
+unsafe impl Send for GpuDecoderInner {}
+unsafe impl Sync for GpuDecoderInner {}
+impl Drop for GpuDecoderInner {
     fn drop(&mut self) {
-        let self_ptr = self.ptr;
-        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecoder *"] {
-            self_ptr->Close();
-            delete self_ptr;
+        let ptr = self.ptr;
+        cpp!(unsafe [ptr as "R3DSDK::GpuDecoder *"] {
+            ptr->Close();
+            delete ptr;
         });
     }
 }
@@ -107,99 +115,111 @@ impl Drop for AsyncDecoder {
 /// and image processing through CUDA (Windows & Linux) or Metal (macOS).
 /// NOTE: 4GB minimum video RAM recommended when using GPU decode
 pub struct GpuDecoder {
-    ptr: *mut core::ffi::c_void,
+    inner: Arc<GpuDecoderInner>,
 }
-// SAFETY: `Send + Sync`, same rationale as `AsyncDecoder` above — opaque owned
-// handle, `&self` decode entry point on the documented thread-safe surface.
-unsafe impl Send for GpuDecoder {}
-unsafe impl Sync for GpuDecoder {}
 
 impl GpuDecoder {
-	/// Create and open the asynchronous decoder.
-    pub fn new() -> Self {
-        let ptr = cpp!(unsafe [] -> *mut core::ffi::c_void as "R3DSDK::GpuDecoder *" {
+    /// Create and open the GPU decoder.
+    pub fn new(sdk: &Sdk) -> Self {
+        let ptr = cpp!(unsafe [] -> *mut c_void as "R3DSDK::GpuDecoder *" {
             R3DSDK::GpuDecoder *ptr = new R3DSDK::GpuDecoder();
             ptr->Open();
             return ptr;
         });
-        Self { ptr }
+        Self { inner: Arc::new(GpuDecoderInner { ptr, _sdk: sdk.clone() }) }
     }
-    pub fn as_mut_ptr(&self) -> *mut core::ffi::c_void {
-        self.ptr
+    /// Pointer to the underlying `R3DSDK::GpuDecoder`.
+    pub fn as_mut_ptr(&self) -> *mut c_void {
+        self.inner.ptr
     }
 
-	/// Determines if the current clip is supported for GPU decompression.
-	/// All clips except for ones recorded on RED ONE are supported.
-    pub fn decode_supported_for_clip(clip: &crate::Clip) -> bool {
+    /// Determines if the current clip is supported for GPU decompression.
+    /// All clips except for ones recorded on RED ONE are supported.
+    pub fn decode_supported_for_clip(clip: &Clip) -> bool {
         let clip_ptr = clip.as_mut_ptr();
-        unsafe {
-            let status: DecodeStatus = std::mem::transmute(cpp!([clip_ptr as "const R3DSDK::Clip *"] -> i32 as "int" {
-                return (R3DSDK::DecodeStatus)R3DSDK::GpuDecoder::DecodeSupportedForClip(*clip_ptr);
-            }));
-            status == DecodeStatus::Ok
-        }
+        let status: i32 = cpp!(unsafe [clip_ptr as "const R3DSDK::Clip *"] -> i32 as "int" {
+            return (int)R3DSDK::GpuDecoder::DecodeSupportedForClip(*clip_ptr);
+        });
+        status == DecodeStatus::Ok as i32
     }
 
-	/// Returns the size OutputBufferSize needs to be in the AsyncDecompressJob
-	/// so the appropriate size input buffer can be allocated before calling
-	/// the DecodeForGpuSdk() function. The following must be set on input:
-	///  1) job.Clip must point to an open Clip and cannot be NULL
-	///  2) job.Mode must be set appropriately
-	/// returns 0 if these input parameters are invalid or no clip is loaded
+    /// Returns the size the output buffer of the [`AsyncDecompressJob`] needs
+    /// to be, so the appropriate size buffer can be allocated before calling
+    /// [`decode_for_gpu_sdk`](GpuDecoder::decode_for_gpu_sdk). The following must be set on input:
+    ///  1) the job's clip must be set to an open [`Clip`]
+    ///  2) the job's mode must be set appropriately
+    ///
+    /// Returns 0 if these input parameters are invalid or no clip is loaded.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
+        // The SDK requires the job's clip to be set.
+        if job.clip.is_none() {
+            return 0;
+        }
         let job_ptr = job.as_mut_ptr();
         cpp!(unsafe [job_ptr as "const R3DSDK::AsyncDecompressJob *"] -> usize as "size_t" {
             return R3DSDK::GpuDecoder::GetSizeBufferNeeded(*job_ptr);
         })
     }
 
-	/// Prepare a frame for decompression & further processing on the GPU.
+    /// Prepare a frame for decompression & further processing on the GPU.
     /// The decompress will be scheduled and the function will immediately return a future.
     ///
     /// You should await the returned future to get the status of the decompress operation.
     /// The future gives you back ownership of the job you passed in, so you can re-use it if needed.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
-        unsafe {
-            let ptr = self.ptr;
-            let job_ptr = job.as_mut_ptr();
-
-            let state = Arc::new(State::new(job));
-            // Owned refcount handed to the SDK; reclaimed in the callback via
-            // `Arc::from_raw`. Keeps `State` + the job/output buffer alive
-            // across an early future drop — see `State` docs.
-            let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
-
-            let callback_ptr = async_decode_callback as extern "C" fn(*mut c_void, DecodeStatus);
-
-            let status: DecodeStatus = std::mem::transmute(cpp!([ptr as "R3DSDK::GpuDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
+        let ptr = self.inner.ptr;
+        submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
+            cpp!(unsafe [ptr as "R3DSDK::GpuDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
                 job_ptr->Callback = (R3DSDK::AsyncDecompressJob::AsyncDecompressCallback)callback_ptr;
                 job_ptr->PrivateData = state_ptr;
                 return ptr->DecodeForGpuSdk(*job_ptr);
-            }));
-            if status != DecodeStatus::Ok {
-                // Job never queued → no callback → reclaim to avoid a leak.
-                drop(Arc::from_raw(state_ptr as *const State<AsyncDecompressJob>));
-                Err(RedError::from(status))
-            } else {
-                Ok(CallbackFuture { state })
-            }
-        }
-    }
-}
-impl Drop for GpuDecoder {
-    fn drop(&mut self) {
-        let self_ptr = self.ptr;
-        cpp!(unsafe [self_ptr as "R3DSDK::GpuDecoder *"] {
-            self_ptr->Close();
-            delete self_ptr;
-        });
+            })
+        })
     }
 }
 
+/// Hand `job` to the SDK through `submit`, which installs the callback and
+/// private data on the job and returns the SDK status. `decoder` is kept alive
+/// until the job completes.
+fn submit_decompress(
+    job: AsyncDecompressJob,
+    decoder: Arc<dyn Send + Sync>,
+    submit: impl FnOnce(*mut c_void, *mut c_void, *mut c_void) -> i32,
+) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
+    if job.clip.is_none() {
+        return Err(RedError::NoClipOpen);
+    }
+    if !job.has_output_buffer() {
+        return Err(RedError::OutputBufferInvalid);
+    }
+    let job_ptr = job.as_mut_ptr();
+    let state = Arc::new(State::new(job, Some(decoder)));
+    // Hand the SDK an *owned* refcount (reclaimed in the callback via
+    // `Arc::from_raw`). This keeps `State` — and the job + output
+    // buffer it holds — alive even if the caller drops the future
+    // before the callback fires; otherwise the SDK would write into
+    // freed memory. See `State` docs.
+    let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
+    let callback_ptr = async_decode_callback as extern "C" fn(*mut c_void, i32) as *mut c_void;
+
+    if let Err(e) = check_status::<DecodeStatus>(submit(job_ptr, state_ptr, callback_ptr)) {
+        // The job was never queued, so the callback will not fire —
+        // reclaim the refcount we handed the SDK to avoid a leak.
+        drop(unsafe { Arc::from_raw(state_ptr as *const State<AsyncDecompressJob>) });
+        return Err(e);
+    }
+    Ok(CallbackFuture { state })
+}
+
+/// A frame to decompress with [`AsyncDecoder::decode_for_gpu_sdk`] or
+/// [`GpuDecoder::decode_for_gpu_sdk`].
 pub struct AsyncDecompressJob {
-    ptr: *mut core::ffi::c_void,
+    ptr: *mut c_void,
+    /// The clip the SDK reads from, kept alive with the job.
+    clip: Option<Arc<Clip>>,
     internal_buffer: Option<AlignedBuffer>,
     metadata_allocated: bool,
+    _sdk: Sdk,
 }
 // SAFETY: `Send` only — a single-owner cursor-state mutator, consumed once per
 // submission then dropped or recycled by the caller. Concurrent `&self` access
@@ -207,15 +227,13 @@ pub struct AsyncDecompressJob {
 // (pinned negative in `tests/send_sync_surface.rs`).
 unsafe impl Send for AsyncDecompressJob {}
 impl AsyncDecompressJob {
-    pub fn new() -> Self {
-        unsafe {
-            let mut ptr = std::ptr::null_mut();
-            let ptrptr = &mut ptr;
-            cpp!([ptrptr as "R3DSDK::AsyncDecompressJob **"] { *ptrptr = new R3DSDK::AsyncDecompressJob(); });
-            Self { ptr, internal_buffer: None, metadata_allocated: false }
-        }
+    /// Create an empty job.
+    pub fn new(sdk: &Sdk) -> Self {
+        let ptr = cpp!(unsafe [] -> *mut c_void as "R3DSDK::AsyncDecompressJob *" { return new R3DSDK::AsyncDecompressJob(); });
+        Self { ptr, clip: None, internal_buffer: None, metadata_allocated: false, _sdk: sdk.clone() }
     }
-    pub fn as_mut_ptr(&self) -> *mut core::ffi::c_void {
+    /// Pointer to the underlying `R3DSDK::AsyncDecompressJob`.
+    pub fn as_mut_ptr(&self) -> *mut c_void {
         self.ptr
     }
 }
@@ -234,12 +252,18 @@ impl Drop for AsyncDecompressJob {
 }
 
 impl AsyncDecompressJob {
-    pub fn set_clip(&mut self, clip: &crate::clip::Clip) {
+    /// The clip to decode from. It must be set before submitting the job.
+    pub fn set_clip(&mut self, clip: &Arc<Clip>) {
         let self_ptr = self.ptr;
         let clip_ptr = clip.as_mut_ptr();
-		cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", clip_ptr as "R3DSDK::Clip *"] {
-			self_ptr->Clip = clip_ptr;
-		})
+        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", clip_ptr as "R3DSDK::Clip *"] {
+            self_ptr->Clip = clip_ptr;
+        });
+        self.clip = Some(clip.clone());
+    }
+    /// The clip set by [`set_clip`](Self::set_clip).
+    pub fn clip(&self) -> Option<&Arc<Clip>> {
+        self.clip.as_ref()
     }
 
     /// Call this if you want to abort processing this frame as soon as possible
@@ -248,8 +272,8 @@ impl AsyncDecompressJob {
         cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *"] { self_ptr->AbortDecode = true; })
     }
 
-    /// 0 = main (A) track, 1 = EPIC/Scarlet-X higlight protection track 2 (X track)
-	/// ignored when doing HDRx blending
+    /// 0 = main (A) track, 1 = EPIC/Scarlet-X highlight protection track 2 (X track),
+    /// ignored when doing HDRx blending
     pub fn set_video_track_no(&mut self, v: usize) {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", v as "size_t"] { self_ptr->VideoTrackNo = v; })
@@ -262,54 +286,61 @@ impl AsyncDecompressJob {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> usize as "size_t" { return self_ptr->VideoFrameNo; })
     }
-	// item is the pointer to the original item as submitted in the Decode() call
-	// typedef void (*DecodeCallback)(AsyncDecompressJob * item, R3DStatus decodeStatus);
-	// DecodeCallback				callback;
-	// void *						privateData;			// available for your use as you see fit, R3D SDK will not touch this variable!
-
-
-	/// Resolution/speed to decode the image at. This will also
-	/// influence how much memory is needed for the output buffer
-	pub fn mode(&self) -> VideoDecodeMode {
+    /// Resolution/speed to decode the image at. This will also
+    /// influence how much memory is needed for the output buffer
+    pub fn mode(&self) -> VideoDecodeMode {
         let self_ptr = self.ptr;
-		unsafe { std::mem::transmute(cpp!([self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> i32 as "int" { return (int)self_ptr->Mode; })) }
-	}
-	/// Resolution/speed to decode the image at. This will also
-	/// influence how much memory is needed for the output buffer
-	pub fn set_mode(&mut self, v: VideoDecodeMode) {
-		let v: i32 = v as i32;
+        enum_from_sdk(cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> i32 as "int" { return (int)self_ptr->Mode; }))
+    }
+    /// Resolution/speed to decode the image at. This will also
+    /// influence how much memory is needed for the output buffer
+    pub fn set_mode(&mut self, v: VideoDecodeMode) {
+        let v: i32 = v as i32;
         let self_ptr = self.ptr;
-		cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", v as "int"] { self_ptr->Mode = (R3DSDK::VideoDecodeMode)v; })
-	}
+        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", v as "int"] { self_ptr->Mode = (R3DSDK::VideoDecodeMode)v; })
+    }
 
-	/// Pointer to the buffer to store the image in. This cannot be
-	/// NULL otherwise the decode will fail. The buffer must be aligned
-	/// on a 16-byte boundary (see sample code).
-	pub fn set_output_buffer(&mut self, buf: *mut core::ffi::c_void, size: usize) {
+    /// Point the output at a caller-owned buffer. Prefer
+    /// [`set_internal_buffer`](Self::set_internal_buffer), which keeps the
+    /// buffer alive for as long as the SDK may write to it.
+    ///
+    /// # Safety
+    /// `buf` must be valid for writes of `size` bytes and aligned on a 16-byte
+    /// boundary until every decode of this job has completed: until the future
+    /// returned by `decode_for_gpu_sdk` resolves, or, if it is dropped first,
+    /// until the SDK is done with the job, which is only known once the job
+    /// itself is dropped.
+    pub unsafe fn set_output_buffer(&mut self, buf: *mut c_void, size: usize) {
         let self_ptr = self.ptr;
-		cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", buf as "void *", size as "size_t"] {
-			self_ptr->OutputBuffer = buf;
-			self_ptr->OutputBufferSize = size;
-		})
-	}
-	/// Allocate internal buffer for the output image.
-    /// Always aligned to 1024 bytes.
-	pub fn allocate_internal_buffer(&mut self) -> RedResult<()> {
+        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", buf as "void *", size as "size_t"] {
+            self_ptr->OutputBuffer = buf;
+            self_ptr->OutputBufferSize = size;
+        })
+    }
+    fn has_output_buffer(&self) -> bool {
+        let self_ptr = self.ptr;
+        cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> bool as "bool" {
+            return self_ptr->OutputBuffer != nullptr && self_ptr->OutputBufferSize != 0;
+        })
+    }
+    /// Allocate an internal buffer of [`AsyncDecoder::size_buffer_needed`]
+    /// bytes for the output, aligned to 16 bytes. Set the clip and mode first.
+    pub fn allocate_internal_buffer(&mut self) -> RedResult<()> {
         let size = AsyncDecoder::size_buffer_needed(self);
         self.set_internal_buffer(AlignedBuffer::new(size, 16)?);
         Ok(())
-	}
+    }
 
     /// Give the job ownership of `buf` and point the output buffer at it,
     /// replacing any previous internal buffer. `buf` must be 16-byte aligned
     /// and at least as large as the decoder's `size_buffer_needed`.
     ///
-    /// Unlike [`set_output_buffer`](Self::set_output_buffer), the buffer then
-    /// lives exactly as long as the job. A submitted job is co-owned by the
-    /// SDK until its completion callback, so the SDK can never write into a
-    /// buffer that was freed under it.
-    pub fn set_internal_buffer(&mut self, buf: AlignedBuffer) {
-        self.set_output_buffer(buf.ptr, buf.len());
+    /// The buffer then lives exactly as long as the job. A submitted job is
+    /// co-owned by the SDK until its completion callback, so the SDK can never
+    /// write into a buffer that was freed under it.
+    pub fn set_internal_buffer(&mut self, mut buf: AlignedBuffer) {
+        // SAFETY: the job owns `buf` from here on, see above.
+        unsafe { self.set_output_buffer(buf.as_mut_ptr(), buf.len()) };
         self.internal_buffer = Some(buf);
     }
 
@@ -324,12 +355,13 @@ impl AsyncDecompressJob {
     pub fn take_internal_buffer(&mut self) -> Option<AlignedBuffer> {
         let buf = self.internal_buffer.take();
         if buf.is_some() {
-            self.set_output_buffer(core::ptr::null_mut(), 0);
+            // SAFETY: a null buffer is never written to.
+            unsafe { self.set_output_buffer(core::ptr::null_mut(), 0) };
         }
         buf
     }
 
-	/// Allocate internal metadata object to receive per-frame metadata.
+    /// Allocate internal metadata object to receive per-frame metadata.
     /// Call this before submitting the job if you want to receive metadata.
     pub fn allocate_frame_metadata(&mut self) {
         if self.metadata_allocated {
@@ -342,20 +374,22 @@ impl AsyncDecompressJob {
             self_ptr->OutputFrameMetadata = new R3DSDK::Metadata();
         })
     }
-    /// Optionally return the decoded frame's per-frame metadata
+    /// The decoded frame's per-frame metadata, if
+    /// [`allocate_frame_metadata`](Self::allocate_frame_metadata) was called.
     pub fn metadata(&self) -> RedResult<&Metadata> {
         if !self.metadata_allocated {
             return Err(RedError::Other("Metadata was not requested in the job".to_string()));
         }
         let self_ptr = self.ptr;
-        let ptr = cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> *const core::ffi::c_void as "void *" {
+        let ptr: *const Metadata = cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> *const Metadata as "void *" {
             return self_ptr->OutputFrameMetadata;
         });
-        Ok(unsafe { &*(ptr as *const Metadata) })
+        // SAFETY: the `Metadata` allocated above, owned by this job.
+        Ok(unsafe { &*ptr })
     }
 }
 
-extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */, decode_status: DecodeStatus) {
+extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */, decode_status: i32) {
     if job.is_null() {
         log::error!("Job pointer is null in callback.");
         return;
@@ -373,11 +407,7 @@ extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */,
     // before this point does not cause a use-after-free. The job stays in the
     // slot — `poll` hands it back; we only record the status here.
     let state = unsafe { Arc::from_raw(ud as *const State<AsyncDecompressJob>) };
-    *state.status.lock().unwrap() = Some(if decode_status == DecodeStatus::Ok {
-        Ok(())
-    } else {
-        Err(RedError::from(decode_status))
-    });
+    *state.status.lock().unwrap() = Some(check_status::<DecodeStatus>(decode_status));
     state.done.store(true, Ordering::Release);
     state.waker.wake();
     // If the future is gone this is the last reference, and dropping it here

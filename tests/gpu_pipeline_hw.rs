@@ -12,15 +12,16 @@
 //! R3D_TEST_CLIP=/path/to/clip.R3D cargo test --test gpu_pipeline_hw -- --ignored
 //! ```
 //!
-//! The redistributable folder is `$R3D_TEST_REDIST_DIR`, or else
-//! `$R3DSDK_DIR/Redistributable/<os>` (with `R3DSDK_DIR` defaulting to `sdk`
-//! in the crate root, as in `build.rs`). The comparison assumes the GPU
-//! output is tightly packed, which holds when the scaled width is a
-//! multiple of 16.
+//! The SDK redistributables are found as described in `common::redist_dir`.
+//! The comparison assumes the GPU output is tightly packed, which holds when
+//! the scaled width is a multiple of 16.
 #![cfg(not(target_os = "macos"))]
+
+mod common;
 
 use core::ffi::c_void;
 use std::future::Future;
+use std::sync::Arc;
 use r3d_rs::gpu::{GpuDecodePipeline, GpuLane, GpuOutput};
 use r3d_rs::*;
 
@@ -33,9 +34,9 @@ fn gpu_pipeline_matches_cpu_decode() {
     let Ok(clip_path) = std::env::var("R3D_TEST_CLIP") else {
         panic!("set R3D_TEST_CLIP to an R3D clip to run this test");
     };
-    let _sdk = Sdk::initialize(&redist_dir(), InitializeFlags::Cuda | InitializeFlags::OpenCL)
+    let sdk = Sdk::initialize(&common::redist_dir(), InitializeFlags::Cuda | InitializeFlags::OpenCL)
         .expect("R3D SDK init");
-    let clip = Clip::from_path(&clip_path).expect("open R3D_TEST_CLIP");
+    let clip = Arc::new(Clip::from_path(&sdk, &clip_path).expect("open R3D_TEST_CLIP"));
     assert!(clip.video_frame_count() >= 8, "test clip needs at least 8 frames");
     let settings = clip.default_image_processing_settings();
     let cpu = |frame: usize, mode: VideoDecodeMode| -> Vec<u16> {
@@ -50,7 +51,7 @@ fn gpu_pipeline_matches_cpu_decode() {
     // AsyncDecoder route — the SDK leaves the upload to `raw_device_mem` to
     // the caller, and skipping it yields a black frame.
     {
-        let pipe = cuda.pipeline(false);
+        let pipe = cuda.pipeline(&sdk, false);
         let out = cuda.alloc(&pipe, &clip, MODE);
         pipe.decode_to_gpu_blocking(&clip, 3, MODE, PIXEL, &settings, out.output()).unwrap();
         assert_matches_cpu("CUDA AsyncDecoder", &cuda.read(&out), &cpu(3, MODE));
@@ -67,7 +68,7 @@ fn gpu_pipeline_matches_cpu_decode() {
 
     // GpuDecoder enabled: whichever route the clip takes must decode correctly.
     {
-        let pipe = cuda.pipeline(true);
+        let pipe = cuda.pipeline(&sdk, true);
         eprintln!("GpuDecoder route taken for this clip: {}", pipe.will_use_gpu_decoder(&clip));
         let out = cuda.alloc(&pipe, &clip, MODE);
         pipe.decode_to_gpu_blocking(&clip, 2, MODE, PIXEL, &settings, out.output()).unwrap();
@@ -76,7 +77,7 @@ fn gpu_pipeline_matches_cpu_decode() {
 
     // Concurrent blocking decodes from several threads share the lane stream.
     {
-        let pipe = cuda.pipeline(false);
+        let pipe = cuda.pipeline(&sdk, false);
         let frames = [0, 1, 6, 7];
         let outs: Vec<_> = frames.iter().map(|_| cuda.alloc(&pipe, &clip, MODE)).collect();
         std::thread::scope(|s| {
@@ -97,7 +98,7 @@ fn gpu_pipeline_matches_cpu_decode() {
 
     // Split stages: overlapped async debayers on distinct stream slots.
     {
-        let pipe = cuda.pipeline(false);
+        let pipe = cuda.pipeline(&sdk, false);
         let frames = [1, 2, 3];
         let decoded: Vec<_> = frames.iter()
             .map(|&f| pipe.submit_decompress(&clip, f, MODE).unwrap())
@@ -128,7 +129,7 @@ fn gpu_pipeline_matches_cpu_decode() {
 
     // A PendingDebayer outliving its pipeline keeps the lane alive.
     {
-        let pipe = cuda.pipeline(false);
+        let pipe = cuda.pipeline(&sdk, false);
         let out = cuda.alloc(&pipe, &clip, MODE);
         let frame = pollster::block_on(pipe.submit_decompress(&clip, 6, MODE).unwrap()).unwrap();
         let pending = pipe.submit_debayer(frame, MODE, PIXEL, &settings, out.output(), 0).unwrap();
@@ -140,7 +141,7 @@ fn gpu_pipeline_matches_cpu_decode() {
     // Decodes abandoned mid-flight: the SDK keeps writing into the scratch
     // buffers, which must stay alive until its callbacks.
     {
-        let pipe = cuda.pipeline(false);
+        let pipe = cuda.pipeline(&sdk, false);
         for f in 0..8 {
             drop(pipe.submit_decompress(&clip, f, MODE).unwrap());
         }
@@ -156,7 +157,7 @@ fn gpu_pipeline_matches_cpu_decode() {
 
     // OpenCL lane: uploads only the bytes the decompressor wrote.
     if let Some(ocl) = OpenCl::create() {
-        let pipe = ocl.pipeline();
+        let pipe = ocl.pipeline(&sdk);
         for (frame, mode) in [(1, MODE), (2, VideoDecodeMode::SixteenthResGood), (3, MODE)] {
             let out = ocl.alloc(&pipe, &clip, mode);
             pipe.decode_to_gpu_blocking(&clip, frame, mode, PIXEL, &settings, out.output()).unwrap();
@@ -165,16 +166,6 @@ fn gpu_pipeline_matches_cpu_decode() {
     } else {
         eprintln!("No OpenCL GPU found; skipping the OpenCL lane");
     }
-}
-
-fn redist_dir() -> String {
-    if let Ok(dir) = std::env::var("R3D_TEST_REDIST_DIR") {
-        return dir;
-    }
-    let sdk = std::env::var("R3DSDK_DIR")
-        .unwrap_or_else(|_| format!("{}/sdk", env!("CARGO_MANIFEST_DIR")));
-    let os = if cfg!(windows) { "win" } else { "linux" };
-    format!("{sdk}/Redistributable/{os}")
 }
 
 /// The GPU frame must be the CPU frame up to the GPU kernels' own
@@ -205,8 +196,10 @@ struct DeviceBuf { ptr: *mut c_void, size: usize }
 // SAFETY: an opaque device pointer; the test only hands it to the pipeline.
 unsafe impl Sync for DeviceBuf {}
 impl DeviceBuf {
-    fn output(&self) -> GpuOutput<'static> {
-        GpuOutput::DeviceMem { ptr: self.ptr, size: self.size }
+    fn output(&self) -> GpuOutput {
+        // SAFETY: the test frees its device buffers only when the `Cuda` /
+        // `OpenCl` helper drops, after every decode into them.
+        unsafe { GpuOutput::device_mem(self.ptr, self.size) }
     }
 }
 
@@ -237,14 +230,18 @@ impl Cuda {
         assert_eq!(unsafe { (self.set_dev)(id) }, 0, "cudaSetDevice");
     }
 
-    fn pipeline(&self, gpu_decompress: bool) -> GpuDecodePipeline {
+    fn pipeline(&self, sdk: &Sdk, gpu_decompress: bool) -> GpuDecodePipeline {
         let cudart = CUDA.as_ref().expect("cudart");
         let mut stream: *mut c_void = core::ptr::null_mut();
         assert_eq!(unsafe { (cudart.cudaStreamCreate)(&mut stream) }, 0);
         self.streams.lock().unwrap().push(stream as usize);
-        let red = RedCuda::new().expect("RedCuda");
-        red.check_compatibility(0, stream).expect("REDCuda compatibility");
-        GpuDecodePipeline::new(GpuLane::Cuda { red, stream, device_id: 0 }, 0, gpu_decompress).unwrap()
+        let red = RedCuda::new(sdk).expect("RedCuda");
+        // SAFETY: `stream` is a stream of device 0, current on this thread and
+        // destroyed only when `self` drops, after every pipeline.
+        unsafe {
+            red.check_compatibility(0, stream).expect("REDCuda compatibility");
+            GpuDecodePipeline::new(GpuLane::cuda(red, stream, 0), 0, gpu_decompress).unwrap()
+        }
     }
 
     fn alloc(&self, pipe: &GpuDecodePipeline, clip: &Clip, mode: VideoDecodeMode) -> DeviceBuf {
@@ -303,12 +300,16 @@ impl OpenCl {
         Some(Self { ctx, queue, allocs: Default::default() })
     }
 
-    fn pipeline(&self) -> GpuDecodePipeline {
+    fn pipeline(&self, sdk: &Sdk) -> GpuDecodePipeline {
         let cache = std::env::temp_dir().join("r3d-rs-opencl-kernels");
         std::fs::create_dir_all(&cache).unwrap();
-        let red = RedOpenCl::new(cache.to_str().unwrap()).expect("RedOpenCl");
-        red.check_compatibility(self.ctx, self.queue).expect("REDCL compatibility");
-        GpuDecodePipeline::new(GpuLane::OpenCl { red, ctx: self.ctx, queue: self.queue }, 0, false).unwrap()
+        let red = RedOpenCl::new(sdk, cache.to_str().unwrap()).expect("RedOpenCl");
+        // SAFETY: the context and queue are released only when `self` drops,
+        // after every pipeline.
+        unsafe {
+            red.check_compatibility(self.ctx, self.queue).expect("REDCL compatibility");
+            GpuDecodePipeline::new(GpuLane::opencl(red, self.ctx, self.queue), 0, false).unwrap()
+        }
     }
 
     fn alloc(&self, pipe: &GpuDecodePipeline, clip: &Clip, mode: VideoDecodeMode) -> DeviceBuf {

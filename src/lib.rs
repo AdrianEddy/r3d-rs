@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
+#![doc = include_str!("../README.md")]
 #![recursion_limit = "1024"]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// With `docs-only`, every `cpp!` block expands to a `panic!("docs-only");` stub.
+#![cfg_attr(feature = "docs-only", allow(semicolon_in_expressions_from_macros, unreachable_code, unused, clippy::diverging_sub_expression, clippy::never_loop))]
+
+#[macro_use]
+mod ffi;
 
 mod asyncdecoder; pub use asyncdecoder::*;
 mod clip;         pub use clip::*;

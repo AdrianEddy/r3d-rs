@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright © 2025 Adrian <adrian.eddy at gmail>
+
 //! Open a clip, print its properties and metadata, decode a few frames with
 //! the R3DDecoder on the first GPU, then decode the first frame on the CPU
 //! and save it as `frame.jpg`.
@@ -8,6 +11,7 @@
 //! e.g. `$R3DSDK_DIR/Redistributable/win`.
 
 use r3d_rs::*;
+use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -15,10 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: decode <redistributable dir> <clip.R3D>".into());
     };
 
-    let _sdk = Sdk::initialize(&redist_dir, InitializeFlags::R3DDecoder)?;
+    let sdk = Sdk::initialize(&redist_dir, InitializeFlags::R3DDecoder)?;
     println!("SDK Version: {}", Sdk::version());
 
-    let mut clip = Clip::from_path(&clip_path)?;
+    let mut clip = Clip::from_path(&sdk, &clip_path)?;
 
     println!("Clip               {:?}", clip.status());
     println!("Resolution         {}x{}", clip.width(), clip.height());
@@ -46,7 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     settings.set_image_pipeline_mode(ImagePipeline::FullGraded);
 
     let mode = VideoDecodeMode::HalfResGood;
-    gpu_decode(&clip, &settings, mode)?;
+    // The asynchronous decode jobs share the clip.
+    let clip = Arc::new(clip);
+    gpu_decode(&sdk, &clip, &settings, mode)?;
 
     // Synchronously decode the first frame on the CPU.
     let buffer = clip
@@ -54,8 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("decode_video_frame allocates when no buffer is passed");
     let (width, height) = gpu::scaled_dims(clip.width(), clip.height(), mode);
     let rgb: Vec<u8> = buffer.as_slice::<u8>()
-        .chunks_exact(3)
-        .flat_map(|bgr| [bgr[2], bgr[1], bgr[0]])
+        .as_chunks::<3>().0
+        .iter()
+        .flat_map(|&[b, g, r]| [r, g, b])
         .collect();
     image::RgbImage::from_raw(width as u32, height as u32, rgb)
         .ok_or("decoded frame does not match its dimensions")?
@@ -68,15 +75,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Decode up to 10 frames concurrently with the R3DDecoder on the first CUDA
 /// or OpenCL device. The R3DDecoder needs a GPU and never falls back to the
 /// CPU, so this is skipped when there is none.
-fn gpu_decode(clip: &Clip, settings: &ImageProcessingSettings, mode: VideoDecodeMode) -> Result<(), RedError> {
-    let mut decoder_opts = R3dDecoderOptions::new()?;
+fn gpu_decode(sdk: &Sdk, clip: &Arc<Clip>, settings: &ImageProcessingSettings, mode: VideoDecodeMode) -> Result<(), RedError> {
+    let mut decoder_opts = R3dDecoderOptions::new(sdk)?;
     decoder_opts.set_memory_pool_size(4096)?;
     decoder_opts.set_concurrent_image_count(8)?;
 
-    if let Some(dev) = R3dDecoderOptions::cuda_device_list().unwrap_or_default().first() {
+    if let Some(dev) = R3dDecoderOptions::cuda_device_list(sdk).unwrap_or_default().first() {
         println!("Device {dev:?}");
         decoder_opts.use_cuda_device(dev)?;
-    } else if let Some(dev) = R3dDecoderOptions::opencl_device_list().unwrap_or_default().first() {
+    } else if let Some(dev) = R3dDecoderOptions::opencl_device_list(sdk).unwrap_or_default().first() {
         println!("Device {dev:?}");
         decoder_opts.use_opencl_device(dev)?;
     } else {
@@ -89,14 +96,14 @@ fn gpu_decode(clip: &Clip, settings: &ImageProcessingSettings, mode: VideoDecode
     // Submit the jobs; each one decodes in the background.
     let mut tasks = Vec::new();
     for i in 0..clip.video_frame_count().min(10) {
-        let mut job = R3dDecodeJob::new()?;
+        let mut job = R3dDecodeJob::new(sdk)?;
         job.set_clip(clip);
         job.set_mode(mode);
         job.set_pixel_type(VideoPixelType::Rgb16bitInterleaved);
         job.set_video_track_no(0);
         job.set_video_frame_no(i);
         job.set_image_processing(settings);
-        job.allocate_internal_buffer(clip)?;
+        job.allocate_internal_buffer()?;
         job.allocate_frame_metadata();
         tasks.push(decoder.decode(job)?);
     }

@@ -1,3 +1,7 @@
+// Minimal stand-in for the OpenCL header: just the declarations the R3D SDK
+// headers need, so the crate builds without the OpenCL SDK installed. The
+// functions themselves are loaded at runtime.
+
 #if defined(__clang__) || _MSC_VER >= 1600
     #include <stdint.h>
 #endif

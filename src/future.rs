@@ -19,6 +19,9 @@ use super::*;
 /// callback fires is therefore memory-safe — the SDK still owns a strong
 /// reference, so the late callback never writes into freed memory.
 ///
+/// The state also keeps the decoder the job was submitted to alive, so the
+/// decoder is never closed while it still has a job in flight.
+///
 /// When the future is dropped first, the callback holds the last reference.
 /// It must not drop it in place: that would destroy the C++ job (`delete` /
 /// `R3DDecoder::ReleaseDecodeJob`) from inside the SDK's own callback for that
@@ -40,17 +43,23 @@ pub(crate) struct State<T> {
     pub(crate) job: Mutex<Option<T>>,
     /// Completion status recorded by the callback; `None` until it fires.
     pub(crate) status: Mutex<Option<Result<(), RedError>>>,
+    /// The decoder the job was submitted to. Declared after `job`, so the job
+    /// is released before the decoder.
+    _decoder: Option<Arc<dyn Send + Sync>>,
 }
 impl<T> State<T> {
-    pub(crate) fn new(job: T) -> Self {
+    pub(crate) fn new(job: T, decoder: Option<Arc<dyn Send + Sync>>) -> Self {
         Self {
             waker: AtomicWaker::new(),
             done: AtomicBool::new(false),
             job: Mutex::new(Some(job)),
             status: Mutex::new(None),
+            _decoder: decoder,
         }
     }
 }
+/// Resolves when the SDK completes an asynchronous decode, giving back the
+/// submitted job on success.
 pub struct CallbackFuture<T> {
     pub(crate) state: Arc<State<T>>,
 }
@@ -67,8 +76,8 @@ impl<T> Future for CallbackFuture<T> {
             let status = this.state.status.lock().unwrap().take();
             if let Some(status) = status {
                 // The callback has recorded the status; hand back ownership of
-                // the job. On error the job is dropped here (matching the
-                // pre-existing API: ownership is only returned on success).
+                // the job. On error the job is dropped here: ownership is only
+                // returned on success.
                 let job = this.state.job.lock().unwrap().take()
                     .expect("R3D completion callback fired without a job in the slot");
                 return Poll::Ready(status.map(|()| job));
@@ -123,8 +132,8 @@ fn drop_off_thread(orphan: Orphan) {
 }
 
 /// Block until every job handed to the reaper so far has been destroyed.
-/// Called before `FinalizeSdk()`, so no deferred job release can reach the
-/// SDK after it has been torn down. No-op if the reaper never started.
+/// No-op if the reaper never started.
+#[cfg(test)]
 pub(crate) fn flush_deferred_drops() {
     let Some(Some(tx)) = REAPER.get() else { return };
     struct Marker(mpsc::Sender<()>);

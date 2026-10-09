@@ -5,31 +5,49 @@
 #![allow(non_snake_case)]
 
 use cpp::*;
-use crate::{ RedResult, RedError, enums::*, image_processing_settings::ImageProcessingSettings };
+use crate::{ RedResult, RedError, Sdk, enums::*, image_processing_settings::ImageProcessingSettings };
+use std::sync::Arc;
+use crate::ffi::check_status;
 use core::ffi::c_void;
 
 cpp!{{
     #include "R3DSDKOpenCL.h"
 }}
 
-pub struct RedOpenCl {
-    ptr: *mut c_void, // R3DSDK::REDCL *
+/// A created `R3DSDK::REDCL`, shared with its debayer jobs, which release
+/// themselves through it.
+struct RedOpenClInner {
+    ptr: *mut c_void,
+    sdk: Sdk,
 }
 // SAFETY: `Send + Sync`. The SDK header documents this lane debayer's
 // `process_blocking` as a "Thread safe blocking call" (see below); `ptr` is an
 // opaque owned `R3DSDK::REDCL *` with no thread affinity.
-unsafe impl Send for RedOpenCl {}
-unsafe impl Sync for RedOpenCl {}
+unsafe impl Send for RedOpenClInner {}
+unsafe impl Sync for RedOpenClInner {}
+impl Drop for RedOpenClInner {
+    fn drop(&mut self) {
+        let opencl = self.ptr;
+        cpp!(unsafe [opencl as "R3DSDK::REDCL *"] { delete opencl; });
+    }
+}
+
+/// The OpenCL debayer of the SDK's GPU decode path.
+/// Needs the SDK initialized with [`InitializeFlags::OpenCL`].
+pub struct RedOpenCl {
+    inner: Arc<RedOpenClInner>,
+}
 
 impl RedOpenCl {
-    /// compiled_kernel_cache_folder is a folder path to where you want us to store and
-	/// load our compiled kernel files on disk. If you provide "" caching of compiled
-	/// kernels will be disabled which is NOT recommended as compile times can be long!
-	/// (see "OpenCL kernel caching.txt" for more information)
-    pub fn new(compiled_kernel_cache_folder: &str) -> RedResult<Self> {
+    /// `compiled_kernel_cache_folder` is a folder path to where you want the SDK to store and
+    /// load our compiled kernel files on disk. If you provide "" caching of compiled
+    /// kernels will be disabled which is NOT recommended as compile times can be long!
+    /// (see "OpenCL kernel caching.txt" for more information)
+    pub fn new(sdk: &Sdk, compiled_kernel_cache_folder: &str) -> RedResult<Self> {
+        sdk.require(InitializeFlags::OpenCL)?;
         let funcs = OPENCL.as_ref().map_err(|_| RedError::RedOpenCLLibraryNotFound)?;
 
-        let folder_cstr = std::ffi::CString::new(compiled_kernel_cache_folder).unwrap();
+        let folder_cstr = std::ffi::CString::new(compiled_kernel_cache_folder).map_err(|_| RedError::InvalidPath)?;
         let folder_ptr = folder_cstr.as_ptr();
 
         let p_clSetKernelArg                   = *funcs.clSetKernelArg                    as *const () as usize;
@@ -171,86 +189,99 @@ impl RedOpenCl {
             return new R3DSDK::REDCL(api, folder_ptr);
         });
 
-        Ok(Self { ptr })
+        Ok(Self { inner: Arc::new(RedOpenClInner { ptr, sdk: sdk.clone() }) })
     }
 
+    /// The SDK this debayer was created with.
+    pub(crate) fn sdk(&self) -> &Sdk {
+        &self.inner.sdk
+    }
+
+    /// Fail unless `job` was created by this debayer.
+    fn check_job(&self, job: &DebayerOpenCLJob) -> RedResult<()> {
+        if Arc::ptr_eq(&job.owner, &self.inner) { Ok(()) } else { Err(RedError::InvalidJobParameter) }
+    }
+
+    /// Create a debayer job for this debayer.
     pub fn create_debayer_job(&self) -> DebayerOpenCLJob {
-        let opencl = self.ptr;
+        let opencl = self.inner.ptr;
         let ptr = cpp!(unsafe [opencl as "R3DSDK::REDCL *"] -> *mut c_void as "void*" {
             return (void*)opencl->createDebayerJob();
         });
-        DebayerOpenCLJob { ptr, owner: self.ptr }
+        DebayerOpenCLJob { ptr, owner: self.inner.clone(), settings: None }
     }
 
     /// checks to see if a context and command queue are compatible with REDCL
     /// This call may take several seconds on slower cards as kernels get compiled
-	/// Decode kernels are compiled asynchronously. All OpenCL processing will be blocked
-	/// until that is complete. See "OpenCL kernel caching.txt" for more information
-    pub fn check_compatibility(&self, context: cl_context, queue: cl_command_queue) -> RedResult<()> {
-        let opencl = self.ptr;
+    /// Decode kernels are compiled asynchronously. All OpenCL processing will be blocked
+    /// until that is complete. See "OpenCL kernel caching.txt" for more information
+    ///
+    /// # Safety
+    /// `context` must be a valid `cl_context` and `queue` a valid
+    /// `cl_command_queue` of that context.
+    pub unsafe fn check_compatibility(&self, context: cl_context, queue: cl_command_queue) -> RedResult<()> {
+        let opencl = self.inner.ptr;
         let mut opencl_error: cl_int = 0;
         let opencl_error_ptr = &mut opencl_error;
-        let status: OpenClStatus = unsafe { std::mem::transmute(cpp!([opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
+        check_status::<OpenClStatus>(cpp!(unsafe [opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
             return (int)opencl->checkCompatibility(context, queue, *opencl_error_ptr);
-        })) };
-        if status == OpenClStatus::Ok {
-            if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
-        } else {
-            Err(status.into())
-        }
+        }))?;
+        if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
     }
 
-	/// processes a frame.
-	/// Thread safe blocking call
-	/// This function will enqueue the cuda kernels and wait for the processing to complete
+    /// processes a frame.
+    /// Thread safe blocking call
+    /// This function will enqueue the OpenCL commands and wait for the processing to complete
+    /// to ensure memory buffers are not released prior to completion of kernel
     ///
-	///	To ensure memory buffers are not released prior to completion of kernel deviceId and stream are used as tokens for internal object mapping.
-	///	Be sure you have already done setCudaDevice on the thread using the passed in deviceId prior to calling process
-    pub fn process_blocking(&self, context: cl_context, queue: cl_command_queue, debayer_job: &mut DebayerOpenCLJob) -> RedResult<()> {
-        let opencl = self.ptr;
+    /// # Safety
+    /// `context` must be a valid `cl_context` and `queue` a valid
+    /// `cl_command_queue` of that context.
+    /// The memory `debayer_job` points to (see its `unsafe` setters) must be
+    /// valid until this returns.
+    pub unsafe fn process_blocking(&self, context: cl_context, queue: cl_command_queue, debayer_job: &mut DebayerOpenCLJob) -> RedResult<()> {
+        self.check_job(debayer_job)?;
+        let opencl = self.inner.ptr;
         let job = debayer_job.ptr;
         let mut opencl_error: cl_int = 0;
         let opencl_error_ptr = &mut opencl_error;
-        let status: OpenClStatus = unsafe { std::mem::transmute(cpp!([opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", job as "R3DSDK::DebayerOpenCLJob *", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
+        check_status::<OpenClStatus>(cpp!(unsafe [opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", job as "R3DSDK::DebayerOpenCLJob *", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
             return (int)opencl->process(context, queue, job, *opencl_error_ptr);
-        })) };
-        if status == OpenClStatus::Ok {
-            if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
-        } else {
-            Err(status.into())
-        }
+        }))?;
+        if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
     }
-	/// enqueues all red processing on the current stream
-	/// once processAsync has been called you will need to call debayerJob->completeAsync
+    /// enqueues all red processing on the current command queue
+    /// once this has been called you will need to call [`DebayerOpenCLJob::complete_async`]
     ///
-	///	This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
-	///	If the commands have already completed there is no wait involved
-    pub fn process_async(&self, context: cl_context, queue: cl_command_queue, debayer_job: &mut DebayerOpenCLJob) -> RedResult<()> {
-        let opencl = self.ptr;
+    /// This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
+    /// If the commands have already completed there is no wait involved
+    ///
+    /// # Safety
+    /// `context` must be a valid `cl_context` and `queue` a valid
+    /// `cl_command_queue` of that context.
+    /// The handles and the memory `debayer_job` points to (see its `unsafe`
+    /// setters) must stay valid until [`DebayerOpenCLJob::complete_async`] returns or the
+    /// job is dropped.
+    pub unsafe fn process_async(&self, context: cl_context, queue: cl_command_queue, debayer_job: &mut DebayerOpenCLJob) -> RedResult<()> {
+        self.check_job(debayer_job)?;
+        let opencl = self.inner.ptr;
         let job_ptr = debayer_job.ptr;
         let mut opencl_error: cl_int = 0;
         let opencl_error_ptr = &mut opencl_error;
-        let status: OpenClStatus = unsafe { std::mem::transmute(cpp!([opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", job_ptr as "R3DSDK::DebayerOpenCLJob *", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
+        check_status::<OpenClStatus>(cpp!(unsafe [opencl as "R3DSDK::REDCL *", context as "cl_context", queue as "cl_command_queue", job_ptr as "R3DSDK::DebayerOpenCLJob *", opencl_error_ptr as "cl_int *"] -> i32 as "int" {
             return (int)opencl->processAsync(context, queue, job_ptr, *opencl_error_ptr);
-        })) };
-        if status == OpenClStatus::Ok {
-            if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
-        } else {
-            Err(status.into())
-        }
+        }))?;
+        if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
     }
 }
 
-impl Drop for RedOpenCl {
-    fn drop(&mut self) {
-        let opencl = self.ptr;
-        cpp!(unsafe [opencl as "R3DSDK::REDCL *"] { delete opencl; });
-    }
-}
-
+/// A debayer job for [`RedOpenCl`].
 pub struct DebayerOpenCLJob {
-    ptr: *mut c_void,   // R3DSDK::DebayerOpenCLJob *
-    owner: *mut c_void, // R3DSDK::REDCL *
+    ptr: *mut c_void,
+    /// The debayer that created the job, which releases it.
+    owner: Arc<RedOpenClInner>,
+    /// The settings the SDK reads, owned by the job.
+    settings: Option<Box<ImageProcessingSettings>>,
 }
 // SAFETY: `Send` only — single-owner cursor-state mutator consumed once per
 // submission. Concurrent `&self` would race the SDK's internal state, so not
@@ -267,21 +298,42 @@ impl DebayerOpenCLJob {
         })
     }
 
-    /// NOTE: Must remain valid until process/processAsync/completeAsync sequence completes
-    pub fn set_raw_host_mem(&mut self, p: *mut c_void) {
+    /// The frame to debayer: the output buffer of a completed decompress
+    /// (an [`AsyncDecompressJob`](crate::AsyncDecompressJob) of
+    /// [`AsyncDecoder`](crate::AsyncDecoder) or [`GpuDecoder`](crate::GpuDecoder)).
+    ///
+    /// # Safety
+    /// `p` must point to such a buffer and stay valid until processing of the job is complete: until
+    /// [`RedOpenCl::process_blocking`] returns, or after [`RedOpenCl::process_async`]
+    /// until [`complete_async`](Self::complete_async) returns or the job is dropped.
+    pub unsafe fn set_raw_host_mem(&mut self, p: *mut c_void) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *", p as "void *"] {
             ptr->raw_host_mem = p;
         });
     }
-    /// Same data as raw_host_mem but already on the GPU
-    pub fn set_raw_device_mem(&mut self, p: *mut c_void) {
+    /// The same data as the raw host memory, already on the GPU (or, for
+    /// [`GpuDecoder`](crate::GpuDecoder) output, filled in by the SDK).
+    ///
+    /// # Safety
+    /// `p` must be a OpenCL buffer on the processing device at least as large
+    /// as the raw host memory, and stay valid until processing of the job is complete: until
+    /// [`RedOpenCl::process_blocking`] returns, or after [`RedOpenCl::process_async`]
+    /// until [`complete_async`](Self::complete_async) returns or the job is dropped.
+    pub unsafe fn set_raw_device_mem(&mut self, p: *mut c_void) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *", p as "void *"] {
             ptr->raw_device_mem = (cl_mem)p;
         });
     }
-    pub fn set_output_device_mem(&mut self, p: *mut c_void, size: usize) {
+    /// The OpenCL buffer to write the debayered image to, of `size` bytes.
+    ///
+    /// # Safety
+    /// `p` must be such a buffer on the processing device, valid for writes of
+    /// `size` bytes until processing of the job is complete: until
+    /// [`RedOpenCl::process_blocking`] returns, or after [`RedOpenCl::process_async`]
+    /// until [`complete_async`](Self::complete_async) returns or the job is dropped.
+    pub unsafe fn set_output_device_mem(&mut self, p: *mut c_void, size: usize) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *", p as "void *", size as "size_t"] {
             ptr->output_device_mem_size = size;
@@ -312,9 +364,11 @@ impl DebayerOpenCLJob {
         });
     }
 
+    /// Image processing settings to apply. These must be set. The job keeps
+    /// its own copy.
     pub fn set_image_processing(&mut self, v: &ImageProcessingSettings) {
         let ptr = self.ptr;
-        let v = v as *const _;
+        let v: *const ImageProcessingSettings = &**self.settings.insert(Box::new(*v));
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *", v as "R3DSDK::ImageProcessingSettings *"] {
             ptr->imageProcessingSettings = v;
         });
@@ -340,7 +394,7 @@ impl Drop for DebayerOpenCLJob {
     fn drop(&mut self) {
         // Ensure completion
         self.complete_async();
-        let owner = self.owner;
+        let owner = self.owner.ptr;
         let ptr = self.ptr;
         cpp!(unsafe [owner as "R3DSDK::REDCL *", ptr as "R3DSDK::DebayerOpenCLJob *"] {
             owner->releaseDebayerJob(ptr);
@@ -348,32 +402,34 @@ impl Drop for DebayerOpenCLJob {
     }
 }
 
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum OpenClStatus {
-    Ok = 0,
-    ErrorProcessing = 1,
-    InvalidJobParameter = 2,
-    /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
-    InvalidJobParameter_mode = 3,
-    /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
-    InvalidJobParameter_raw_host_mem = 4,
-    /// Raw device mem was NULL
-    InvalidJobParameter_raw_device_mem = 5,
-    /// unsupported pixel type
-    InvalidJobParameter_pixelType = 6,
-    /// Output buffer Size must be non zero.
-    /// Output buffer must be allocated prior to passing it into the sdk
-    InvalidJobParameter_output_device_mem_size = 7,
-    InvalidJobParameter_output_device_mem = 8,
-    /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
-    InvalidJobParameter_ColorVersion1 = 9,
-    /// GPU Device did not meet minimum requirements.
-    UnableToUseGPUDevice = 10,
-    /// Error loading R3DSDK dynamic library
-    UnableToLoadLibrary = 11,
-    ParameterUnsupported = 12,
-	InvalidAPIObject = 13
+sdk_enum! {
+    /// Status of a [`RedOpenCl`] call.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub enum OpenClStatus {
+        Ok = 0,
+        ErrorProcessing = 1,
+        InvalidJobParameter = 2,
+        /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+        InvalidJobParameter_mode = 3,
+        /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+        InvalidJobParameter_raw_host_mem = 4,
+        /// Raw device mem was NULL
+        InvalidJobParameter_raw_device_mem = 5,
+        /// unsupported pixel type
+        InvalidJobParameter_pixelType = 6,
+        /// Output buffer Size must be non zero.
+        /// Output buffer must be allocated prior to passing it into the sdk
+        InvalidJobParameter_output_device_mem_size = 7,
+        InvalidJobParameter_output_device_mem = 8,
+        /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+        InvalidJobParameter_ColorVersion1 = 9,
+        /// GPU Device did not meet minimum requirements.
+        UnableToUseGPUDevice = 10,
+        /// Error loading R3DSDK dynamic library
+        UnableToLoadLibrary = 11,
+        ParameterUnsupported = 12,
+        InvalidAPIObject = 13,
+    }
 }
 
 impl From<OpenClStatus> for RedError {
@@ -449,6 +505,8 @@ pub struct cl_image_format {
     pub image_channel_data_type: cl_channel_type,
 }
 
+/// The OpenCL functions this crate and the SDK use, loaded from the OpenCL library at runtime.
+#[allow(clippy::type_complexity)] // the OpenCL C API signatures
 pub struct OpenCLFunctions {
     _opencl: dl::Library,
 
@@ -499,6 +557,10 @@ pub struct OpenCLFunctions {
 }
 
 impl OpenCLFunctions {
+    /// Load the OpenCL library and look up its functions.
+    ///
+    /// # Safety
+    /// Loading a library runs its initialization code; see [`libloading::Library::new`].
     pub unsafe fn new() -> Result<Self, libloading::Error> {
         let candidates = if cfg!(target_os = "windows") {
             vec![ "OpenCL.dll" ]
@@ -511,7 +573,7 @@ impl OpenCLFunctions {
         for filename in candidates {
             if let Ok(l) = unsafe { dl::Library::new(filename) } {
                 opencl = Some(l);
-                log::debug!("Loaded {}", &filename);
+                log::debug!("Loaded {filename}");
                 break;
             }
         }
@@ -571,4 +633,5 @@ impl OpenCLFunctions {
     }
 }
 
+/// The OpenCL library, loaded on first use.
 pub static OPENCL: LazyLock<Result<OpenCLFunctions, libloading::Error>> = LazyLock::new(|| unsafe { OpenCLFunctions::new() });

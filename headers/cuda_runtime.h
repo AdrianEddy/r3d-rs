@@ -1,3 +1,7 @@
+// Minimal stand-in for the CUDA runtime header: just the declarations the R3D SDK
+// headers need, so the crate builds without the CUDA Toolkit installed. The
+// functions themselves are loaded at runtime.
+
 enum cudaError { _ = 0};
 enum cudaChannelFormatKind { __ = 0 };
 

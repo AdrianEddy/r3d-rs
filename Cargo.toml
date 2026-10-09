@@ -2,30 +2,54 @@
 name = "r3d-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Adrian <adrian.eddy at gmail>"]
-description = "Rust bindings for R3D RAW SDK"
+description = "Safe, async-first Rust bindings for RED's R3D RAW SDK"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/AdrianEddy/r3d-rs"
+documentation = "https://docs.rs/r3d-rs"
 readme = "README.md"
-keywords = ["red", "red raw", "sdk", "video"]
-categories = ["video", "media-processing"]
+keywords = ["red", "r3d", "raw", "video", "camera"]
+categories = ["multimedia::video", "multimedia::images", "external-ffi-bindings", "api-bindings"]
+include = [
+    "/src",
+    "/headers",
+    "/build.rs",
+    "/examples",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-Apache-2.0",
+]
 
 [features]
 default = ["link"]
+# Link the R3D SDK static library. Disable to link it yourself.
 link = []
+# Metal debayer (macOS). A feature rather than automatic on macOS because the
+# C++ build cannot evaluate `target_os` conditions.
 metal-debayer = []
+# Build without the R3D SDK, for documentation only (docs.rs, CI): every SDK call panics.
+docs-only = ["dep:cpp_macros", "cpp_macros/docs-only"]
 
 [dependencies]
 bitflags = "2.13"
-cpp = "0.5"
-futures-util = "0.3"
-log = "0.4"
+cpp = "0.5.11"
+cpp_macros = { version = "0.5.11", optional = true }
+futures-util = { version = "0.3.31", default-features = false }
 libloading = "0.9"
+log = "0.4.22"
 pollster = "1.0"
 
 [build-dependencies]
-cpp_build = "0.5"
+cpp_build = "0.5.11"
 
 [dev-dependencies]
-image = "0.25"
+futures-util = "0.3.31"
+image = { version = "0.25.6", default-features = false, features = ["jpeg"] }
 static_assertions = "1.1"
+
+[package.metadata.docs.rs]
+features = ["docs-only", "metal-debayer"]
+no-default-features = true

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Stage 2 (R3D cl_image fast-path) + Stage 3 (GpuDecoder integration)
-// pure-function surface tests. None of these touch the OpenCL runtime
-// or open an R3D clip — they validate the analytical layer that the
-// integration paths (`gpu-video::decoder::r3d`,
-// `wgpu-texture-interop::backends::opencl`) build on.
-//
-// The full lane / clip integration matrix lives in
-// `__backup/run_sdk_matrix.ps1` — it spawns the gpu-video player
-// against an R3D clip on every lane × wgpu-backend cell and verifies
-// `exit=0 / decoded N`.
+// Copyright © 2026 Adrian <adrian.eddy at gmail>
+
+//! Output-sizing helpers of the GPU pipeline: the `cl_image` pixel format
+//! pairing and the decode-mode scaling. These are pure functions, so the tests
+//! neither initialize the SDK nor touch a GPU or a clip; `gpu_pipeline_hw.rs`
+//! covers the pipeline itself.
 
 use r3d_rs::{
     VideoDecodeMode, VideoPixelType,
@@ -20,12 +15,11 @@ use r3d_rs::{
 // ClImageDataType — SDK pairing contract
 // ─────────────────────────────────────────────────────────────────────
 
-/// `ClImageDataType::expected_pixel_type` must mirror the SDK's
-/// documented pairing (`REDOpenCLGpuDecodeSample.cpp:417-428`). A
-/// silent edit that breaks this would surface deep inside
-/// `GpuDecodePipeline::run_debayer` as
+/// `ClImageDataType::expected_pixel_type` must mirror the pairing documented
+/// in the SDK's `REDOpenCLGpuDecodeSample.cpp`. A silent edit that breaks
+/// this would surface deep inside `GpuDecodePipeline::run_debayer` as
 /// `Status_InvalidJobParameter_pixelType` — by then the caller has
-/// already booked the cl_image; pin it here.
+/// already allocated the cl_image; pin it here.
 #[test]
 fn cl_image_data_type_pairs_with_sdk_pixel_type() {
     assert_eq!(
@@ -38,7 +32,7 @@ fn cl_image_data_type_pairs_with_sdk_pixel_type() {
     );
 }
 
-/// Per `REDOpenCLGpuDecodeSample.cpp:427`, the SDK
+/// Per the SDK's `REDOpenCLGpuDecodeSample.cpp`, the SDK
 /// `output_device_mem_size` for both supported channel types is
 /// `width × height × 4 × 2`. Pin the per-pixel byte count.
 #[test]
@@ -52,12 +46,9 @@ fn cl_image_data_type_bytes_per_pixel_is_eight() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// `scaled_dims` divides the clip dims by 1 / 2 / 4 / 8 / 16 per
-/// `VideoDecodeMode`. The cl_image / MTLTexture allocator sizes its
-/// output via this helper; a mismatch with the SDK's internal divisor
-/// would cause the SDK to write past the allocation's end.
-///
-/// Numerical divisors documented at `r3d-rs/src/gpu.rs` against the
-/// `VideoDecodeMode` enum.
+/// `VideoDecodeMode`. cl_image / MTLTexture outputs are sized with this
+/// helper; a mismatch with the SDK's internal divisor would cause the SDK
+/// to write past the allocation's end.
 #[test]
 fn scaled_dims_matches_video_decode_mode_divisors() {
     // FullResPremium: identity.
@@ -76,8 +67,8 @@ fn scaled_dims_matches_video_decode_mode_divisors() {
 /// Edge: scaled_dims does NOT round up to a 16-pixel multiple. That
 /// is the cl_image / MTLTexture contract — the destination object
 /// carries its own row pitch and is sized to the raw scaled dims.
-/// `compute_output_size` (buffer-shape) is where the 16-pixel rounding
-/// lives — this helper deliberately does not duplicate it.
+/// The flat-buffer output size (`GpuDecodePipeline::result_frame_size`)
+/// is where the 16-pixel rounding lives.
 #[test]
 fn scaled_dims_preserves_non_16_multiple_dims() {
     // 4080 % 16 == 0 already; pick 4081 to force a non-multiple.
@@ -88,26 +79,9 @@ fn scaled_dims_preserves_non_16_multiple_dims() {
 
 /// scaled_dims integer-divides — when the scaling divisor exceeds a
 /// dimension, the result is zero, NOT one. Callers must treat zero
-/// as an error (gpu-video's OpenCL lane explicitly does at
-/// `decoder/r3d.rs` Stage 2.5).
+/// as an error.
 #[test]
 fn scaled_dims_integer_division_zeroes_below_divisor() {
     assert_eq!(scaled_dims(10, 10, VideoDecodeMode::SixteenthResGood), (0, 0));
     assert_eq!(scaled_dims(15, 32, VideoDecodeMode::SixteenthResGood), (0, 2));
 }
-
-// ─────────────────────────────────────────────────────────────────────
-// GpuDecodePipeline construction sanity (no SDK init / no clip)
-// ─────────────────────────────────────────────────────────────────────
-//
-// `GpuDecodePipeline::new(lane, threads, enable_gpu_decompress)`
-// constructs an `AsyncDecoder` + optionally a `GpuDecoder`; both
-// require the R3D SDK to be initialised before the host process can
-// reach `AsyncDecoder::new` without crashing (per `R3DSDK.h:20-25`).
-//
-// We cannot exercise the constructor here without the test process
-// pinning the SDK init flag set — and the SDK init is a process-
-// global singleton that other tests in this crate may depend on.
-// The signature shape is covered by `assert_impl_all!` style checks
-// in `tests/send_sync_surface.rs`; the runtime behaviour is covered
-// by the gpu-video matrix runner (`__backup/run_sdk_matrix.ps1`).

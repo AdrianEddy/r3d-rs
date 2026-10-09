@@ -1,169 +1,136 @@
-# r3d-rs - Safe, modern Rust bindings for the R3D RAW SDK
+# r3d-rs
 
-Safe, ergonomic, and async-first Rust bindings for **R3D RAW SDK**.
+[![Crates.io](https://img.shields.io/crates/v/r3d-rs.svg)](https://crates.io/crates/r3d-rs)
+[![Documentation](https://docs.rs/r3d-rs/badge.svg)](https://docs.rs/r3d-rs)
+[![CI](https://github.com/AdrianEddy/r3d-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianEddy/r3d-rs/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/r3d-rs.svg)](#license)
+[![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)
 
-<p align="center">
-  <a href="#"><img alt="License: MIT/Apache-2.0" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-informational"></a>
-  <a href="#"><img alt="Rust Edition" src="https://img.shields.io/badge/rust-Edition_2024-blue"></a>
-  <a href="#"><img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-success"></a>
-</p>
+Safe, ergonomic, async-first Rust bindings for RED's **R3D RAW SDK**, for reading
+and decoding RED `.R3D`, Nikon N-RAW (`.NEV`) and R3D NE clips.
 
 ## Highlights
 
-* **High-level, safe interfaces** for all R3D RAW SDK APIs.
-* **Async jobs, no callbacks**: futures replace C++-style callbacks, making async jobs intuitive.
-* **Proper error handling**.
-* **Idiomatic iterators & enums**.
+* **Safe, high-level interfaces** for clips, metadata, timecode, IMU samples, audio,
+  image processing settings, and CPU and GPU decoding.
+* **Async jobs, no callbacks**: decodes return futures that resolve to the finished job.
 * **Async runtime agnostic**: works with any executor; use `pollster` to block when you want simplicity.
-* **Native docs**: all structs and enums are documented based on the official SDK documentation
-* **Cross-platform**: Windows (x64 and ARM64), Linux, macOS.
+* **GPU decoding** through the SDK's `R3DDecoder` (CUDA, OpenCL) or a bundled
+  decompress + debayer pipeline ([`gpu::GpuDecodePipeline`]) for CUDA, OpenCL and Metal.
+* **Custom I/O**: read clips from any `Read + Seek` source (`Sdk::initialize_with_io`).
+* **Sound lifetimes**: every object keeps the SDK loaded, and asynchronous jobs keep their
+  clip, settings and decoder alive until the SDK is done with them.
+* **Proper error handling**, idiomatic iterators and enums.
+* **Native docs**: items are documented based on the official SDK documentation.
+* **Cross-platform**: Windows (x64 and ARM64), Linux (x64), macOS.
 
-**Based on R3D RAW SDK 9.2.1**.
+Based on **R3D RAW SDK 9.2.1**.
 
----
+## Requirements
 
-## Quick start
+* The **R3D RAW SDK**, available from [RED's developer page](https://www.red.com/developers)
+  under RED's own license.
+* `R3DSDK_DIR` set to the SDK folder (the one containing `Include` and `Lib`) when
+  building. It defaults to `sdk` in the crate root, which is convenient in a checkout of this repository.
+* A C++ compiler, as for the [`cc`](https://crates.io/crates/cc) crate.
+* Rust 1.88 or newer.
+* At runtime, the SDK's redistributable dynamic libraries. Pass their folder to `Sdk::initialize`:
+  * **Windows**: `RED*-x64.dll` (x64) or `RED*-a64.dll` (ARM64).
+  * **Linux**: `RED*-x64.so`.
+  * **macOS**: `RED*.dylib`.
 
-### Requirements
-
-* Install **R3D RAW SDK** for your platform.
-* Set `R3DSDK_DIR` variable to point to the sdk files
-* At runtime, make sure the SDK redistributable files are discoverable:
-
-  * **Windows**: `RED*-x64.dll` in the executable dir or on `PATH`.
-  * **Linux**: `RED*-x64.so` on `LD_LIBRARY_PATH` or `rpath`.
-  * **macOS**: `RED*.dylib` in `@rpath` or `Frameworks`.
-
-### Cargo
+On Windows ARM64 the SDK supports CPU decoding and OpenCL processing only; requesting
+`InitializeFlags::Cuda` there fails with `RedError::CudaNotAvailable`.
 
 ```toml
 [dependencies]
 r3d-rs = "0.1"
-pollster = "0.3" # optional, for simple blocking
+pollster = "1" # optional, for simple blocking
 ```
 
----
+## Cargo features
+
+| Feature         | Default | Description |
+|-----------------|---------|-------------|
+| `link`          | yes     | Link the SDK's static library from `R3DSDK_DIR`. Disable it to link the library yourself. |
+| `metal-debayer` | no      | Metal GPU debayering (macOS). |
+| `docs-only`     | no      | Build without the SDK, for documentation only (e.g. on docs.rs): every SDK call panics. |
 
 ## Example
 
-A concise walkthrough: load the SDK, open a clip, inspect metadata, read & process a frame.
+Load the SDK, open a clip, inspect its metadata, and decode frames on the GPU and on the CPU.
+See [`examples/decode.rs`](https://github.com/AdrianEddy/r3d-rs/blob/main/examples/decode.rs) for a complete program.
 
-```rust
+```rust,no_run
 use r3d_rs::*;
+use std::sync::Arc;
 
-fn main() -> Result<(), RedError> {
-    pollster::block_on(async {
-        let _sdk = Sdk::initialize(".", InitializeFlags::R3DDecoder)?;
-        println!("SDK Version: {}", Sdk::version());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load the SDK's dynamic libraries from its redistributable folder.
+    let sdk = Sdk::initialize("path/to/Redistributable/win", InitializeFlags::R3DDecoder)?;
+    println!("SDK version: {}", Sdk::version());
 
-        let mut clip = Clip::from_path("sample.R3D")?;
+    let mut clip = Clip::from_path(&sdk, "A001_C001_0101AB_001.R3D")?;
+    println!("{}x{}, {} frames", clip.width(), clip.height(), clip.video_frame_count());
+    println!("Timecode: {:?}", clip.timecode(0));
+    for (key, value) in clip.metadata_iter() {
+        println!("{key: <30} {value}");
+    }
 
-        println!("Clip               {:?}",  clip.status());
-        println!("Resolution         {}x{}", clip.width(), clip.height());
-        println!("Video track count: {}",    clip.video_track_count());
-        println!("Timecode(0):       {:?}",  clip.timecode(0));
-        println!("Frames:            {}",    clip.video_frame_count());
-        println!("Metadata:");
-        for (key, value) in clip.metadata_iter() {
-            println!("{key: <30} {value:?}");
-        }
-        println!("First 20 IMU samples:");
-        for x in clip.imu_samples(..20) {
-            println!("{x:?}");
-        }
-        println!("Processing settings:");
-        let mut settings = clip.default_image_processing_settings();
-        println!("Brightness: {}", settings.brightness());
-        println!("ISO:        {}", settings.iso());
-        println!("Kelvin:     {}", settings.kelvin());
+    let mut settings = clip.default_image_processing_settings();
+    settings.set_output_tone_map(ToneMap::Medium);
 
-        // Set custom settings
-        settings.set_hdr_peak_nits(1000);
-        settings.set_cdl_enabled(true);
-        settings.set_output_tone_map(ToneMap::None);
-        settings.set_image_pipeline_mode(ImagePipeline::FullGraded);
+    // Decode 4 frames at once on the first CUDA device. The jobs share the
+    // clip, as they read it until they complete.
+    let clip = Arc::new(clip);
+    let mut options = R3dDecoderOptions::new(&sdk)?;
+    let device = R3dDecoderOptions::cuda_device_list(&sdk)?.into_iter().next().ok_or("no CUDA device")?;
+    options.use_cuda_device(&device)?;
+    let decoder = R3dDecoder::new(&options)?;
 
-        let mut decoder_opts = R3dDecoderOptions::new()?;
-        decoder_opts.set_memory_pool_size(4096)?;
-        decoder_opts.set_concurrent_image_count(8)?;
+    let mut jobs = Vec::new();
+    for frame in 0..4 {
+        let mut job = R3dDecodeJob::new(&sdk)?;
+        job.set_clip(&clip);
+        job.set_mode(VideoDecodeMode::HalfResGood);
+        job.set_pixel_type(VideoPixelType::Rgb16bitInterleaved);
+        job.set_video_frame_no(frame);
+        job.set_image_processing(&settings);
+        job.allocate_internal_buffer()?;
+        jobs.push(decoder.decode(job)?);
+    }
+    // Any executor works; `pollster` simply blocks on the futures.
+    for job in pollster::block_on(futures_util::future::join_all(jobs)) {
+        println!("Decoded frame {}", job?.video_frame_no());
+    }
 
-        // Use first CUDA device
-        for dev in R3dDecoderOptions::cuda_device_list()? {
-            println!("Device {dev:?}");
-            decoder_opts.use_cuda_device(&dev)?;
-            break;
-        }
+    // Decode a frame on the CPU, synchronously.
+    let mode = VideoDecodeMode::QuarterResGood;
+    let frame = clip
+        .decode_video_frame(0, mode, VideoPixelType::Bgra8bitInterleaved, Some(&settings), None, None)?
+        .expect("decode_video_frame allocates the buffer when none is passed");
+    let (width, height) = gpu::scaled_dims(clip.width(), clip.height(), mode);
+    println!("{width}x{height} BGRA frame: {} bytes", frame.as_slice::<u8>().len());
 
-        let decoder = R3dDecoder::new(&decoder_opts)?;
-
-        // Spawn 10 simultaneous tasks
-        let mut tasks = Vec::new();
-        for i in 0..10 {
-            let mut job = R3dDecodeJob::new()?;
-            job.set_clip(&clip);
-            job.set_mode(VideoDecodeMode::HalfResGood);
-            job.set_pixel_type(VideoPixelType::Rgb16bitInterleaved);
-            job.set_video_track_no(0);
-            job.set_video_frame_no(i);
-            job.set_image_processing(&settings);
-            job.allocate_internal_buffer(&clip)?;
-            job.allocate_frame_metadata();
-            // Start decoding in the background
-            tasks.push(decoder.decode(job)?);
-        }
-
-        println!("All jobs submitted");
-
-        let results = futures_util::future::join_all(tasks).await;
-
-        println!("All jobs finished");
-
-        for job in results {
-            let job = job?;
-            println!("Frame {} metadata:", job.video_frame_no());
-            for (key, value) in job.metadata()?.iter() {
-                println!("{key: <30} {value:?}");
-            }
-        }
-
-        // Synchronously decode first frame on the CPU:
-        let buffer = clip.decode_video_frame(0, VideoDecodeMode::HalfResGood, VideoPixelType::Bgra8bitInterleaved, Some(&settings), None, None)?;
-        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_raw(clip.width() as u32 / 2, clip.height() as u32 / 2, buffer.unwrap().as_slice::<u8>().to_vec()).unwrap())
-            .save("frame.jpg").unwrap();
-
-        Ok(())
-    })
+    Ok(())
 }
 ```
 
----
+## Not yet covered
 
-## SDK loading details
+These parts of the SDK have no bindings yet:
 
-This crate **requires the R3D SDK libraries at build time** to be able to link them when compiling.
-Set `R3DSDK_DIR` to the SDK root dir
-
-At runtime, `Sdk::initialize` loads the redistributable libraries from the directory it is given:
-`*-x64.dll` on Windows x64, `*-a64.dll` on Windows ARM64. The ARM64 SDK (9.2) supports CPU decoding
-and OpenCL processing only — requesting `InitializeFlags::Cuda` there fails with
-`RedError::CudaNotAvailable`.
-
-If you prefer to link the libraries yourself, add `default-features = false` to your Cargo.toml
-
----
-
-## TODO
-
-* [ ] Clip audio functions
-* [ ] Clip trim functions
-* [ ] Lut3D functions
-* [ ] Camera streaming functions
-* [ ] More end-to-end examples (transcode, thumbnails, batch decode)
-
----
+* Clip trimming and snapshots.
+* 3D LUT loading and export.
+* Reading and writing RMD sidecar files (XMP, image and HDR settings).
+* Markers, external metadata, white balance picking and floating point audio.
+* Camera streaming and RED ROCKET.
 
 ## License
 
-Dual-licensed under **MIT** or **Apache-2.0** at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-Apache-2.0) at your option.
 
-> Note: R3D RAW SDK is distributed under its own license/EULA. You must comply with RED’s terms when downloading and redistributing the SDK binaries.
+The R3D RAW SDK is distributed by RED under its own license. You must comply with RED's
+terms when downloading the SDK and redistributing its libraries.
+
+[`gpu::GpuDecodePipeline`]: https://docs.rs/r3d-rs/latest/r3d_rs/gpu/struct.GpuDecodePipeline.html

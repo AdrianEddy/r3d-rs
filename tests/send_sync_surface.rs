@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-//! Compile-only proof that the per-type Send / Sync classification (the
+//! Compile-only check that the per-type Send / Sync classification (the
 //! `unsafe impl` blocks sit next to each type, each with a `// SAFETY:` note)
-//! matches the audit in stage-6c.md § 6c.0.3.A.
+//! stays as intended.
 //! Any future refactor that accidentally adds a blanket `unsafe impl<T> Sync`
 //! would silently re-enable Sync on the Send-only types — the
 //! `assert_not_impl_all!` lines below catch that immediately.
@@ -14,6 +14,12 @@ use static_assertions::{assert_impl_all, assert_not_impl_all};
 // ─────────────────────────────────────────────────────────────────────
 // Send + Sync — SDK objects with documented thread-safe `&self` surface.
 // ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn sdk_is_send_sync() {
+    // Shared by every object using the SDK, which may live on any thread.
+    assert_impl_all!(Sdk: Send, Sync);
+}
 
 #[test]
 fn decoders_are_send_sync() {
@@ -96,8 +102,8 @@ fn cpp_class_value_types_are_send_sync() {
     // the `// SAFETY:` note next to each type's `unsafe impl Send`.
     assert_impl_all!(ImageProcessingSettings: Send, Sync);
     assert_impl_all!(HdrProcessingSettings:   Send, Sync);
-    assert_impl_all!(VideoDecodeJob:          Send, Sync);
     assert_impl_all!(Metadata:                Send, Sync);
+    assert_impl_all!(FrameMetadata:           Send, Sync);
 }
 
 #[test]

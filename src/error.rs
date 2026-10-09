@@ -3,7 +3,9 @@
 
 use crate::enums::*;
 
+/// Errors reported by the R3D SDK and by these bindings.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum RedError {
 
     // Initialization errors
@@ -57,25 +59,25 @@ pub enum RedError {
     DecoderNotOpened,
 
     // R3D status
-	ErrorProcessing,
-	InvalidJobParameter,
+    ErrorProcessing,
+    InvalidJobParameter,
     /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
-	InvalidJobParameterMode,
+    InvalidJobParameterMode,
     /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
-	InvalidJobParameterRawHostMem,
-	InvalidJobParameterRawDeviceMem,
+    InvalidJobParameterRawHostMem,
+    InvalidJobParameterRawDeviceMem,
     /// unsupported pixel type
-	InvalidJobParameterPixelType,
+    InvalidJobParameterPixelType,
     /// Output buffer Size must be non zero.
     /// Output buffer must be allocated prior to passing it into the sdk
-	InvalidJobParameterOutputDeviceMemSize,
-	InvalidJobParameterOutputDeviceMem,
+    InvalidJobParameterOutputDeviceMemSize,
+    InvalidJobParameterOutputDeviceMem,
     /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
-	InvalidJobParameterColorVersion1,
+    InvalidJobParameterColorVersion1,
     /// null, or unopened clip.
-	InvalidJobParameterClip,
+    InvalidJobParameterClip,
     /// GPU Device did not meet minimum requirements.
-	UnableToUseGPUDevice,
+    UnableToUseGPUDevice,
     /// No GPU Devices were setup on the R3DDecoderOptions class
     NoGPUDeviceSpecified,
     /// Error loading R3DSDK dynamic library
@@ -89,6 +91,16 @@ pub enum RedError {
     CudaError(i32),
     OpenCLError(i32),
     MetalError(i32),
+
+    /// The SDK returned a status code these bindings do not know.
+    UnknownStatus(i32),
+
+    /// [`Sdk::initialize`](crate::Sdk::initialize) was called while the SDK is
+    /// loaded; use [`Sdk::current`](crate::Sdk::current) to share it.
+    AlreadyInitialized,
+    /// The SDK was not initialized with this optional component, which the
+    /// call needs.
+    NotInitializedWith(InitializeFlags),
 
     BufferTooSmall { needed: usize, provided: usize },
     Alloc(std::alloc::LayoutError),
@@ -167,6 +179,9 @@ impl std::fmt::Display for RedError {
             Self::CudaError(cuda_error)             => write!(f, "CUDA error: {cuda_error}"),
             Self::OpenCLError(opencl_error)         => write!(f, "OpenCL error: {opencl_error}"),
             Self::MetalError(metal_error)           => write!(f, "Metal error: {metal_error}"),
+            Self::UnknownStatus(status)             => write!(f, "Unknown R3D SDK status code: {status}"),
+            Self::AlreadyInitialized                => write!(f, "The R3D SDK is already initialized"),
+            Self::NotInitializedWith(flags)         => write!(f, "The R3D SDK was not initialized with {flags:?}"),
             Self::Alloc(e)                          => write!(f, "Allocation error: {e}"),
 
             Self::Other(s)                          => write!(f, "RED error: {s}"),
@@ -269,4 +284,5 @@ impl From<std::alloc::LayoutError> for RedError {
     }
 }
 
+/// `Result` with [`RedError`] as the error type.
 pub type RedResult<T> = Result<T, RedError>;

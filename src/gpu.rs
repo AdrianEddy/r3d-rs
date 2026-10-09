@@ -18,7 +18,7 @@ use std::task::{ Context, Poll };
 
 use crate::{
     AlignedBuffer, AsyncDecoder, AsyncDecompressJob, CallbackFuture, Clip, GpuDecoder,
-    ImageProcessingSettings, RedError, RedResult, VideoDecodeMode, VideoPixelType,
+    ImageProcessingSettings, RedError, RedResult, Sdk, VideoDecodeMode, VideoPixelType,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -29,18 +29,16 @@ use crate::RedMetal;
 
 use crate::{ RedOpenCl, cl_context, cl_command_queue };
 
-/// Lane primitive selection.
+/// The GPU a [`GpuDecodePipeline`] debayers on: the lane-specific debayer
+/// object (`RedCuda` / `RedMetal` / [`RedOpenCl`]) plus the stream, queue or
+/// context handles it runs on. Created with the `unsafe` constructors, which
+/// take the raw handles.
 ///
-/// Each variant owns the lane-specific debayer object (`RedCuda` /
-/// `RedMetal` / `RedOpenCl`) plus the queue/stream/context handles
-/// needed for `process_blocking`.
+/// # Thread-affinity
 ///
-/// # Safety / thread-affinity
+/// The lanes carry different concurrency contracts:
 ///
-/// The variants below carry different concurrency contracts; the
-/// per-variant audit lives next to the `unsafe impl` block.
-///
-/// - **`Cuda`**: the CUDA stream + device id are thread-affine for
+/// - **CUDA**: the CUDA stream + device id are thread-affine for
 ///   *enqueue* purposes — any `cuLaunchKernel` / `cudaMemcpyAsync`
 ///   submission requires the calling thread to have `device_id` as
 ///   its current CUDA device (`cuCtxSetCurrent` /
@@ -50,21 +48,23 @@ use crate::{ RedOpenCl, cl_context, cl_command_queue };
 ///   on `process_blocking` / `decode_to_gpu`, documented on those
 ///   methods. The handle itself has no apartment-model thread
 ///   affinity, so `Send` across threads is sound. The SDK keys its
-///   per-frame state on `(device_id, stream)` (`R3DSDKCuda.h:152-153`),
+///   per-frame state on `(device_id, stream)` (see `R3DSDKCuda.h`),
 ///   so [`GpuDecodePipeline`] serializes blocking debayers on this
 ///   stream; its async path runs each in-flight debayer on its own
 ///   pipeline-owned stream. Do not share `stream` with another
 ///   pipeline.
 ///
-/// - **`Metal`**: `id<MTLCommandQueue>` is Apple-documented thread-
+/// - **Metal**: `id<MTLCommandQueue>` is Apple-documented thread-
 ///   safe — multiple host threads may submit `MTLCommandBuffer`s
 ///   concurrently. The opaque `*mut c_void` is a refcounted
 ///   Objective-C object.
 ///
-/// - **`OpenCl`**: `cl_context` and `cl_command_queue` are OpenCL-spec
+/// - **OpenCL**: `cl_context` and `cl_command_queue` are OpenCL-spec
 ///   thread-safe (all OpenCL API calls except `clSetKernelArg` are
 ///   thread-safe per OpenCL 1.2 §A.2).
-pub enum GpuLane {
+pub struct GpuLane(Lane);
+
+enum Lane {
     #[cfg(not(target_os = "macos"))]
     Cuda  { red: RedCuda,    stream: CudaStream, device_id: i32 },
     #[cfg(feature = "metal-debayer")]
@@ -72,60 +72,134 @@ pub enum GpuLane {
     OpenCl{ red: RedOpenCl,  ctx: cl_context, queue: cl_command_queue },
 }
 
-// SAFETY: see the per-variant audit on `GpuLane` above. Rust does not
+// SAFETY: see the per-lane audit on `GpuLane` above. Rust does not
 // permit per-variant `unsafe impl`; the blanket is intentional and the
-// audit comment on the enum is the source of truth for reviewers.
+// audit comment on the struct is the source of truth for reviewers.
 unsafe impl Send for GpuLane {}
 unsafe impl Sync for GpuLane {}
 
-/// GPU output destination handed to `decode_to_gpu` / `decode_to_gpu_blocking`.
+impl GpuLane {
+    /// Debayer with CUDA on `stream` of device `device_id`.
+    ///
+    /// # Safety
+    /// `stream` must be a CUDA stream of device `device_id` (or null for its
+    /// default stream), valid for as long as this lane, the pipeline built on
+    /// it and every [`PendingDebayer`] of that pipeline live.
+    #[cfg(not(target_os = "macos"))]
+    pub unsafe fn cuda(red: RedCuda, stream: CudaStream, device_id: i32) -> Self {
+        Self(Lane::Cuda { red, stream, device_id })
+    }
+
+    /// Debayer with OpenCL on `queue` of `ctx`.
+    ///
+    /// # Safety
+    /// `ctx` must be a valid `cl_context` and `queue` a valid
+    /// `cl_command_queue` of it, both valid for as long as this lane and the
+    /// pipeline built on it live.
+    pub unsafe fn opencl(red: RedOpenCl, ctx: cl_context, queue: cl_command_queue) -> Self {
+        Self(Lane::OpenCl { red, ctx, queue })
+    }
+
+    /// Debayer with Metal on `queue`.
+    ///
+    /// # Safety
+    /// `queue` must be a valid `id<MTLCommandQueue>`, valid for as long as
+    /// this lane and the pipeline built on it live.
+    #[cfg(feature = "metal-debayer")]
+    pub unsafe fn metal(red: RedMetal, queue: *mut c_void) -> Self {
+        Self(Lane::Metal { red, queue })
+    }
+
+    fn sdk(&self) -> &Sdk {
+        match &self.0 {
+            #[cfg(not(target_os = "macos"))]
+            Lane::Cuda { red, .. } => red.sdk(),
+            #[cfg(feature = "metal-debayer")]
+            Lane::Metal { red, .. } => red.sdk(),
+            Lane::OpenCl { red, .. } => red.sdk(),
+        }
+    }
+}
+
+/// GPU output destination handed to `decode_to_gpu` / `decode_to_gpu_blocking`,
+/// created with the `unsafe` constructors, which take the raw handles.
 ///
-/// `DeviceMem` covers CUDA `CUdeviceptr`, OpenCL `cl_mem` BUFFER, and
-/// Metal `id<MTLBuffer>`. `MetalTexture` is the Metal-only `cl_image`-
+/// A device buffer covers CUDA `CUdeviceptr`, OpenCL `cl_mem` BUFFER, and
+/// Metal `id<MTLBuffer>`. A Metal texture is the Metal-only `cl_image`-
 /// equivalent path: caller-allocated `MTLTexture` written by the SDK
 /// debayer via `set_output_device_image`, no expand pass needed on
 /// consume because the SDK writes 4-channel RGBA with α = 1.
 ///
-/// `OpenClImage` is the OpenCL equivalent — a `cl_image` typed as
+/// An OpenCL image is the OpenCL equivalent — a `cl_image` typed as
 /// `{CL_RGBA, CL_UNORM_INT16}` (or `CL_HALF_FLOAT`) the SDK debayer
 /// writes via `write_imagef()`. **4-channel RGBA output with α = 1.0
 /// implicit**; consumers can skip the RGB→RGBA expand pass that the
-/// `DeviceMem` (buffer) path requires. See `docs/r3d.md` § 4 for the
-/// pixel_type ↔ data_type pairing and the rationale.
-pub enum GpuOutput<'a> {
+/// device buffer path requires. See [`ClImageDataType`] for the
+/// pixel_type ↔ data_type pairing.
+///
+/// Every constructor requires the output to stay valid until the decode it is
+/// passed to has completed: until `decode_to_gpu*` or `debayer_blocking`
+/// returns, or until the [`PendingDebayer`] of `submit_debayer` is completed
+/// or dropped.
+pub struct GpuOutput(Output);
+
+enum Output {
     DeviceMem { ptr: *mut c_void, size: usize },
     #[cfg(feature = "metal-debayer")]
     MetalTexture { texture: *mut c_void, size: usize },
-    /// OpenCL `cl_image` 2D output. `image` must be a `cl_mem` from
-    /// `clCreateImage` whose `cl_image_format` channel order is
-    /// `CL_RGBA` and whose data type is paired with `pixel_type` per
-    /// the table in `docs/r3d.md` § 4 (encoded in [`ClImageDataType`]).
-    ///
-    /// Only valid with `GpuLane::OpenCl`. The CUDA and Metal arms of
-    /// `run_debayer` reject this variant at the lane match.
     OpenClImage {
-        /// `cl_mem` of type `CL_MEM_OBJECT_IMAGE2D`.
         image: *mut c_void,
         /// Image dimensions, in pixels (un-rounded). The SDK reads the
-        /// dimensions from the cl_image object directly; we keep them
-        /// on the variant for diagnostics + the consumer-side
-        /// `image_row_pitch_from_cl_image` helper.
+        /// dimensions from the cl_image object directly; these only
+        /// size the output passed to the SDK (with
+        /// [`ClImageDataType::bytes_per_pixel`]).
         width: usize,
         height: usize,
         data_type: ClImageDataType,
     },
-    #[allow(dead_code)]
-    _Lifetime(std::marker::PhantomData<&'a ()>),
+}
+
+impl GpuOutput {
+    /// A device buffer of `size` bytes on the pipeline's lane: a CUDA device
+    /// pointer, an OpenCL `cl_mem` buffer or a Metal `id<MTLBuffer>`.
+    ///
+    /// # Safety
+    /// `ptr` must be such a buffer, valid for writes of `size` bytes until the
+    /// decode it is passed to has completed (see [`GpuOutput`]).
+    pub unsafe fn device_mem(ptr: *mut c_void, size: usize) -> Self {
+        Self(Output::DeviceMem { ptr, size })
+    }
+
+    /// A Metal `id<MTLTexture>`, with `size` the byte size of its storage.
+    ///
+    /// # Safety
+    /// `texture` must be such a texture on the pipeline's device, valid until
+    /// the decode it is passed to has completed (see [`GpuOutput`]).
+    #[cfg(feature = "metal-debayer")]
+    pub unsafe fn metal_texture(texture: *mut c_void, size: usize) -> Self {
+        Self(Output::MetalTexture { texture, size })
+    }
+
+    /// An OpenCL 2D `cl_image` of `width × height` pixels whose
+    /// `cl_image_format` channel order is `CL_RGBA` and whose data type is
+    /// `data_type`, which pairs with the decode's `pixel_type`. Only valid on
+    /// the OpenCL lane.
+    ///
+    /// # Safety
+    /// `image` must be such an image of the pipeline's context, valid until
+    /// the decode it is passed to has completed (see [`GpuOutput`]).
+    pub unsafe fn opencl_image(image: *mut c_void, width: usize, height: usize, data_type: ClImageDataType) -> Self {
+        Self(Output::OpenClImage { image, width, height, data_type })
+    }
 }
 
 /// OpenCL `cl_image` data type, in the strict subset the R3D SDK's
 /// OpenCL debayer accepts. Encoded in the type system so a caller
-/// cannot construct a `GpuOutput::OpenClImage` whose pixel_type ↔
+/// cannot construct an OpenCL image [`GpuOutput`] whose pixel_type ↔
 /// image-format pairing the SDK would reject.
 ///
-/// The pairings are documented in
-/// `sdk/Sample code/GPU decoding/REDOpenCLGpuDecodeSample.cpp:417-428`:
-/// the cl_image must have `channel_order = CL_RGBA` and a data type
+/// The pairings are documented in the SDK's `REDOpenCLGpuDecodeSample.cpp`
+/// sample: the cl_image must have `channel_order = CL_RGBA` and a data type
 /// paired with the SDK `VideoPixelType` the kernel was set up for —
 /// `CL_UNORM_INT16` with `Rgb16bitInterleaved`, `CL_HALF_FLOAT` with
 /// `RgbHalfFloatInterleaved`. The sample also warns that
@@ -161,8 +235,8 @@ impl ClImageDataType {
 
     /// Per-pixel byte size of the cl_image format. The SDK's
     /// `output_device_mem_size` field is **destination-aware** for
-    /// cl_image outputs: per the OpenCL sample
-    /// `REDOpenCLGpuDecodeSample.cpp:427`, the size is
+    /// cl_image outputs: per the SDK's OpenCL sample
+    /// `REDOpenCLGpuDecodeSample.cpp`, the size is
     /// `width × height × 4 × 2` (4 channels × 2 B) for `UnormInt16`
     /// and `HalfFloat`. Both data types are 2 B / channel here.
     pub const fn bytes_per_pixel(self) -> usize {
@@ -174,8 +248,8 @@ impl ClImageDataType {
 
 /// Bundled GPU decode pipeline.
 ///
-/// Owns an `AsyncDecoder`, an optional `GpuDecoder` (Stage 3 — GPU
-/// wavelet decompress, host-output Bayer), a `GpuLane`, and a small
+/// Owns an `AsyncDecoder`, an optional `GpuDecoder` (GPU wavelet
+/// decompress, host-output Bayer), a `GpuLane`, and a small
 /// pool of raw-Bayer scratch buffers (`AlignedBuffer`s, 16-byte
 /// aligned per SDK contract). The pool hands out the smallest idle
 /// buffer that fits and steady-states to one slot per `(clip, mode)`
@@ -191,10 +265,10 @@ impl ClImageDataType {
 /// # CUDA call-site contract
 ///
 /// The CUDA lane requires the calling thread to have the same CUDA
-/// device set as `GpuLane::Cuda::device_id` (via `cuCtxSetCurrent` or
+/// device set as the CUDA lane's `device_id` (via `cuCtxSetCurrent` or
 /// the runtime API equivalent) before calling `decode_to_gpu*`. The
 /// SDK reads the current device from the calling thread — see
-/// `debayer/cuda.rs:97-115`.
+/// `RedCuda::process_blocking`.
 pub struct GpuDecodePipeline {
     async_decoder: AsyncDecoder,
     /// `GpuDecoder` performs the wavelet decompression on the GPU
@@ -207,7 +281,7 @@ pub struct GpuDecodePipeline {
     /// without GPU decompression (e.g. Windows ARM64, per the SDK
     /// 9.2.0 release notes) and any future clip with codec features
     /// `GpuDecoder` hasn't been updated for fall back to
-    /// `AsyncDecoder`. See `docs/r3d.md` § 5.
+    /// `AsyncDecoder`.
     gpu_decoder:   Option<GpuDecoder>,
     /// Whether frames may still be routed to `gpu_decoder`. Cleared for
     /// good the first time the `GpuDecoder` rejects a frame at submit
@@ -241,11 +315,11 @@ struct LaneShared {
     /// CUDA debayer streams for the async (`process_async`) path — one
     /// per concurrently in-flight debayer, indexed by the caller's
     /// `stream_slot`. The SDK keys its per-frame internal object mapping
-    /// on `(deviceId, stream)` (`R3DSDKCuda.h:152-153`: "deviceId and
+    /// on `(deviceId, stream)` (`R3DSDKCuda.h`: "deviceId and
     /// stream are used as tokens for internal object mapping"), so two
     /// concurrent `processAsync` jobs MUST run on distinct streams or
     /// they collide. RED's own sample round-robins `NUM_STREAMS`
-    /// (`REDCudaGpuDecodeSample.cpp:555-596`). Each slot is marked busy
+    /// (`REDCudaGpuDecodeSample.cpp`). Each slot is marked busy
     /// while a `PendingDebayer` uses it. Created lazily on first async
     /// submit (under the caller's current CUDA context) and destroyed in
     /// `Drop`.
@@ -385,7 +459,7 @@ impl DecompressedFrame {
     }
 
     fn raw_host(&self) -> *mut c_void {
-        self.job.internal_buffer().map_or(core::ptr::null_mut(), |b| b.ptr)
+        self.job.internal_buffer().map_or(core::ptr::null_mut(), |b| b.as_ptr().cast_mut())
     }
 }
 
@@ -434,9 +508,9 @@ impl Future for PendingDecompress {
 /// [`GpuDecodePipeline::submit_debayer`]. Owns everything the SDK reads
 /// until `completeAsync`: the decompressed frame (the SDK reads frame
 /// metadata from its host buffer, `raw_host_mem`), the pooled
-/// `raw_device_mem` upload buffer, and a copy of the image processing
-/// settings. It also holds the pipeline's lane, so the `RedCuda` and the
-/// debayer stream outlive it even if the pipeline is dropped first.
+/// `raw_device_mem` upload buffer, and (through the job) a copy of the image
+/// processing settings. It also holds the pipeline's lane, so the `RedCuda`
+/// and the debayer stream outlive it even if the pipeline is dropped first.
 ///
 /// Finish it with [`GpuDecodePipeline::complete_debayer`] or by dropping
 /// it: both wait for the GPU work (`completeAsync`), then return the
@@ -445,7 +519,6 @@ impl Future for PendingDecompress {
 pub struct PendingDebayer {
     job:        Option<DebayerCudaJob>,
     raw_device: Option<RawDeviceBuf>,
-    settings:   Option<Box<ImageProcessingSettings>>,
     frame:      Option<DecompressedFrame>,
     /// Claimed debayer stream slot.
     slot:       Option<usize>,
@@ -456,8 +529,8 @@ pub struct PendingDebayer {
 impl Drop for PendingDebayer {
     fn drop(&mut self) {
         // `DebayerCudaJob::drop` runs `completeAsync`, which waits for the
-        // GPU work reading `raw_device`, `settings` and the frame's host
-        // buffer, so it must go before any of them is recycled.
+        // GPU work reading `raw_device` and the frame's host buffer, so it
+        // must go before either is recycled.
         drop(self.job.take());
         if let Some(slot) = self.slot.take() {
             self.shared.release_debayer_stream(slot);
@@ -476,18 +549,16 @@ impl Drop for PendingDebayer {
 impl GpuDecodePipeline {
     /// Create a new pipeline. `threads = 0` selects the SDK default
     /// ([`AsyncDecoder::threads_available`]). `enable_gpu_decompress`
-    /// controls Stage 3 — when `true`, the pipeline owns a paired
+    /// controls GPU decompression — when `true`, the pipeline owns a paired
     /// [`GpuDecoder`] and per-frame picks it via
     /// [`GpuDecoder::decode_supported_for_clip`] (RED ONE clips and any
     /// future codec feature `GpuDecoder` hasn't been updated for fall
     /// back to the `AsyncDecoder`). When `false`, only the
-    /// `AsyncDecoder` runs — the prior pipeline behaviour. Default is
-    /// caller-driven; gpu-video plumbs `DecoderOptions
-    /// ::prefer_gpu_decompress` through to this argument.
+    /// `AsyncDecoder` runs.
     pub fn new(lane: GpuLane, threads: usize, enable_gpu_decompress: bool) -> RedResult<Self> {
         Ok(Self {
-            async_decoder:      AsyncDecoder::new(threads),
-            gpu_decoder:        enable_gpu_decompress.then(GpuDecoder::new),
+            async_decoder:      AsyncDecoder::new(lane.sdk(), threads),
+            gpu_decoder:        enable_gpu_decompress.then(|| GpuDecoder::new(lane.sdk())),
             gpu_decoder_usable: AtomicBool::new(enable_gpu_decompress),
             shared: Arc::new(LaneShared {
                 lane,
@@ -516,7 +587,7 @@ impl GpuDecodePipeline {
     /// `AsyncDecoder`. Returns `false` when:
     /// - the pipeline was constructed with `enable_gpu_decompress = false`,
     /// - or `GpuDecoder::decode_supported_for_clip(clip)` returns false
-    ///   (RED ONE clips per `R3DSDKDecoder.h:114-115`, etc.),
+    ///   (e.g. RED ONE clips),
     /// - or the `GpuDecoder` already failed on this setup (see
     ///   [`submit_decompress`](Self::submit_decompress)).
     ///
@@ -533,9 +604,9 @@ impl GpuDecodePipeline {
     /// `R3DSDK::DebayerCudaJob::ResultFrameSize` and the OpenCL / Metal
     /// equivalents read the *raw_host_mem* frame header to discover the
     /// scaled dimensions — they return `0` if `raw_host_mem` isn't set
-    /// yet, as the SDK GPU-decode samples make clear (see
-    /// `Sample code/GPU decoding/REDCudaGpuDecodeSample.cpp:438-453`
-    /// and `REDOpenCLGpuDecodeSample.cpp:383-390`). This pipeline
+    /// yet, as the SDK GPU-decode samples make clear (see the SDK's
+    /// `REDCudaGpuDecodeSample.cpp` and `REDOpenCLGpuDecodeSample.cpp`
+    /// samples). This pipeline
     /// allocates the GPU output buffer BEFORE the AsyncDecoder
     /// decompress, so we cannot call the SDK helper at that point.
     ///
@@ -561,14 +632,14 @@ impl GpuDecodePipeline {
     /// queue/stream this pipeline owns. The scratch buffer is returned
     /// to the pool when this function returns. Dropping the future
     /// part-way is memory-safe (see [`PendingDecompress`]).
-    pub async fn decode_to_gpu<'a>(
+    pub async fn decode_to_gpu(
         &self,
-        clip:       &Clip,
+        clip:       &Arc<Clip>,
         frame_no:   usize,
         mode:       VideoDecodeMode,
         pixel_type: VideoPixelType,
         settings:   &ImageProcessingSettings,
-        out:        GpuOutput<'a>,
+        out:        GpuOutput,
     ) -> RedResult<()> {
         // The one-call path is the two split stages run back-to-back: a
         // pipelined caller drives `submit_decompress` for several frames
@@ -577,7 +648,7 @@ impl GpuDecodePipeline {
         self.debayer_blocking(frame, mode, pixel_type, settings, out)
     }
 
-    /// **Stage 1 (decompress) — submit.** Pick the per-clip
+    /// **Decompress — submit.** Pick the per-clip
     /// decompressor, acquire a CPU Bayer scratch buffer from the pool,
     /// and submit the SDK decompress, returning immediately with a
     /// [`PendingDecompress`] that resolves to the [`DecompressedFrame`].
@@ -585,22 +656,22 @@ impl GpuDecodePipeline {
     /// `GpuDecoder` and `AsyncDecoder` produce identical scratch
     /// contents per the SDK contract; the route is chosen per-clip (see
     /// [`will_use_gpu_decoder`](Self::will_use_gpu_decoder)).
-    /// `pixel_type` is **not** a stage-1 input — it only affects the
-    /// debayer.
+    /// `pixel_type` is **not** an input of the decompress — it only
+    /// affects the debayer.
     ///
     /// If the `GpuDecoder` rejects the frame, it is resubmitted to the
     /// `AsyncDecoder`. If that succeeds, the `GpuDecoder` is the problem
     /// (e.g. the SDK was initialized without the GPU component it needs),
     /// and the pipeline stops routing frames to it.
     ///
-    /// Await the returned future (the scheduler keeps up to `depth` of
-    /// these in flight via `select_all` semantics), then hand the frame
+    /// Await the returned future (several can be in flight at once),
+    /// then hand the frame
     /// to [`debayer_blocking`](Self::debayer_blocking) or
     /// [`submit_debayer`](Self::submit_debayer). The frame owns its
     /// scratch, so out-of-order completion is sound.
     pub fn submit_decompress(
         &self,
-        clip:     &Clip,
+        clip:     &Arc<Clip>,
         frame_no: usize,
         mode:     VideoDecodeMode,
     ) -> RedResult<PendingDecompress> {
@@ -631,7 +702,7 @@ impl GpuDecodePipeline {
     fn submit_with(
         &self,
         decompressor: Decompressor<'_>,
-        clip:         &Clip,
+        clip:         &Arc<Clip>,
         frame_no:     usize,
         mode:         VideoDecodeMode,
     ) -> RedResult<PendingDecompress> {
@@ -640,7 +711,7 @@ impl GpuDecodePipeline {
         // `GpuDecoder`. Both consult the same per-clip metadata but the
         // underlying plugin call is different (`REDR3D-x64.dll` vs
         // `REDGpuDecoder-x64.dll`).
-        let mut job = AsyncDecompressJob::new();
+        let mut job = AsyncDecompressJob::new(clip.sdk());
         job.set_clip(clip);
         job.set_mode(mode);
         job.set_video_frame_no(frame_no);
@@ -661,33 +732,32 @@ impl GpuDecodePipeline {
         Ok(PendingDecompress { fut, raw_len, gpu_decoded: decompressor.is_gpu() })
     }
 
-    /// **Stage 2 (debayer) — blocking.** Consume a completed decompress
+    /// **Debayer — blocking.** Consume a completed decompress
     /// `frame` and debayer it into `out` on the lane queue/stream.
     ///
     /// `process_blocking` runs the SDK `processAsync` *and*
     /// `completeAsync`, so on `Ok(())` the GPU output is fully realized
     /// and visible on the queue this pipeline owns — there is no GPU
-    /// fence left to wait on (the pipelined caller emits
-    /// `SyncPoint::Cpu`). The scratch is returned to the pool on return,
-    /// success or failure.
+    /// fence left to wait on. The scratch is returned to the pool on
+    /// return, success or failure.
     ///
     /// On the CUDA lane, concurrent calls take turns: they share the lane
     /// stream, which the SDK uses as a per-frame state key. For
     /// overlapping debayers use [`submit_debayer`](Self::submit_debayer).
-    pub fn debayer_blocking<'a>(
+    pub fn debayer_blocking(
         &self,
         frame:      DecompressedFrame,
         mode:       VideoDecodeMode,
         pixel_type: VideoPixelType,
         settings:   &ImageProcessingSettings,
-        out:        GpuOutput<'a>,
+        out:        GpuOutput,
     ) -> RedResult<()> {
         let result = self.run_debayer(&frame, mode, pixel_type, settings, out);
         self.shared.recycle_frame(frame);
         result
     }
 
-    /// **Stage 2 (debayer) — non-blocking submit. CUDA lane only.**
+    /// **Debayer — non-blocking submit. CUDA lane only.**
     ///
     /// Enqueues the SDK `processAsync` for a completed decompress on the
     /// debayer stream selected by `stream_slot`, **deferring**
@@ -701,24 +771,24 @@ impl GpuDecodePipeline {
     /// `stream_slot` selects which debayer stream the job runs on.
     /// Concurrently in-flight debayers need **distinct** slots — the SDK
     /// keys per-frame internal state on `(deviceId, stream)`
-    /// (`R3DSDKCuda.h:152-153`), so two concurrent jobs on the same
+    /// (`R3DSDKCuda.h`), so two concurrent jobs on the same
     /// stream collide. A slot whose previous `PendingDebayer` is still
     /// alive is rejected with an error. Streams are created lazily.
     ///
-    /// This is the overlap path of `docs/todo2-raw-pipelining.md` § 5.7:
-    /// frame N's debayer GPU work runs while the CPU sets up + enqueues
-    /// frame N+1, instead of the host blocking on each `completeAsync`.
+    /// This lets frame N's debayer GPU work run while the CPU sets up +
+    /// enqueues frame N+1, instead of the host blocking on each
+    /// `completeAsync`.
     ///
     /// The caller MUST have the lane's CUDA device current (call-site
     /// contract, same as `process_blocking`).
     #[cfg(not(target_os = "macos"))]
-    pub fn submit_debayer<'a>(
+    pub fn submit_debayer(
         &self,
         frame:       DecompressedFrame,
         mode:        VideoDecodeMode,
         pixel_type:  VideoPixelType,
         settings:    &ImageProcessingSettings,
-        out:         GpuOutput<'a>,
+        out:         GpuOutput,
         stream_slot: usize,
     ) -> RedResult<PendingDebayer> {
         // From here on every exit path, error or not, goes through
@@ -726,18 +796,15 @@ impl GpuDecodePipeline {
         let mut pending = PendingDebayer {
             job:        None,
             raw_device: None,
-            settings:   None,
             frame:      Some(frame),
             slot:       None,
             shared:     Arc::clone(&self.shared),
         };
-        let GpuLane::Cuda { red, device_id, .. } = &self.shared.lane else {
+        let Lane::Cuda { red, device_id, .. } = &self.shared.lane.0 else {
             return Err(RedError::Other("submit_debayer requires the CUDA lane".into()));
         };
-        let (out_ptr, out_size) = match out {
-            GpuOutput::DeviceMem { ptr, size } => (ptr, size),
-            _ => return Err(RedError::Other(
-                "CUDA submit_debayer requires GpuOutput::DeviceMem".into())),
+        let Output::DeviceMem { ptr: out_ptr, size: out_size } = out.0 else {
+            return Err(RedError::Other("CUDA submit_debayer requires a device buffer output".into()));
         };
         let stream = self.shared.claim_debayer_stream(stream_slot)?;
         pending.slot = Some(stream_slot);
@@ -749,13 +816,16 @@ impl GpuDecodePipeline {
         if !frame.gpu_decoded {
             cuda_upload(raw_device_ptr, frame.raw_host(), frame.raw_len, stream)?;
         }
-        // The job keeps a pointer to the settings; the copy lives as long
-        // as the job, whatever the caller does with `settings`.
-        let settings: &ImageProcessingSettings = pending.settings.insert(Box::new(*settings));
-        let job = pending.job.insert(Self::build_cuda_debayer_job(
-            red, mode, pixel_type, settings, frame.raw_host(), raw_device_ptr, out_ptr, out_size));
+        // SAFETY: `pending` owns the frame's host buffer and `raw_device` until
+        // the job completes in `PendingDebayer::drop`, and `out` stays valid
+        // until then per `GpuOutput`'s contract.
+        let job = pending.job.insert(unsafe { Self::build_cuda_debayer_job(
+            red, mode, pixel_type, settings, frame.raw_host(), raw_device_ptr, out_ptr, out_size) });
         // Enqueue on `stream` and return WITHOUT completeAsync.
-        red.process_async(*device_id, stream, job)?;
+        // SAFETY: `stream` is the pipeline's own debayer stream, alive until
+        // `LaneShared` drops after `pending`; the job's memory is kept alive as
+        // above.
+        unsafe { red.process_async(*device_id, stream, job) }?;
         Ok(pending)
     }
 
@@ -771,14 +841,14 @@ impl GpuDecodePipeline {
     }
 
     /// Blocking convenience for sync callers.
-    pub fn decode_to_gpu_blocking<'a>(
+    pub fn decode_to_gpu_blocking(
         &self,
-        clip:       &Clip,
+        clip:       &Arc<Clip>,
         frame_no:   usize,
         mode:       VideoDecodeMode,
         pixel_type: VideoPixelType,
         settings:   &ImageProcessingSettings,
-        out:        GpuOutput<'a>,
+        out:        GpuOutput,
     ) -> RedResult<()> {
         pollster::block_on(self.decode_to_gpu(clip, frame_no, mode, pixel_type, settings, out))
     }
@@ -796,8 +866,13 @@ impl GpuDecodePipeline {
     /// ([`run_debayer`](Self::run_debayer)) and async
     /// ([`submit_debayer`](Self::submit_debayer)) paths: mode / pixel /
     /// settings + host/device-mem wiring.
+    ///
+    /// # Safety
+    /// `host`, `raw_device` and `out_ptr` must stay valid until the job has
+    /// completed, see the `DebayerCudaJob` setters.
     #[cfg(not(target_os = "macos"))]
-    fn build_cuda_debayer_job(
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_cuda_debayer_job(
         red:        &RedCuda,
         mode:       VideoDecodeMode,
         pixel_type: VideoPixelType,
@@ -811,9 +886,12 @@ impl GpuDecodePipeline {
         job.set_mode(mode);
         job.set_pixel_type(pixel_type);
         job.set_image_processing(settings);
-        job.set_raw_host_mem(host);
-        job.set_raw_device_mem(raw_device);
-        job.set_output_device_mem(out_ptr, out_size);
+        // SAFETY: the caller keeps the memory valid, see above.
+        unsafe {
+            job.set_raw_host_mem(host);
+            job.set_raw_device_mem(raw_device);
+            job.set_output_device_mem(out_ptr, out_size);
+        }
         job
     }
 
@@ -832,20 +910,19 @@ impl GpuDecodePipeline {
         mode:       VideoDecodeMode,
         pixel_type: VideoPixelType,
         settings:   &ImageProcessingSettings,
-        out:        GpuOutput<'_>,
+        out:        GpuOutput,
     ) -> RedResult<()> {
         let shared = &*self.shared;
-        match &shared.lane {
+        match &shared.lane.0 {
             #[cfg(not(target_os = "macos"))]
-            GpuLane::Cuda { red, stream, device_id } => {
-                let (out_ptr, out_size) = match out {
-                    GpuOutput::DeviceMem { ptr, size } => (ptr, size),
+            Lane::Cuda { red, stream, device_id } => {
+                let (out_ptr, out_size) = match out.0 {
+                    Output::DeviceMem { ptr, size } => (ptr, size),
                     #[cfg(feature = "metal-debayer")]
-                    GpuOutput::MetalTexture { .. } =>
-                        return Err(RedError::Other("CUDA lane received GpuOutput::MetalTexture".into())),
-                    GpuOutput::OpenClImage { .. } =>
-                        return Err(RedError::Other("CUDA lane received GpuOutput::OpenClImage".into())),
-                    GpuOutput::_Lifetime(_) => unreachable!(),
+                    Output::MetalTexture { .. } =>
+                        return Err(RedError::Other("CUDA lane received a Metal texture output".into())),
+                    Output::OpenClImage { .. } =>
+                        return Err(RedError::Other("CUDA lane received an OpenCL image output".into())),
                 };
 
                 let _lane_stream = lock(&shared.lane_stream);
@@ -856,9 +933,14 @@ impl GpuDecodePipeline {
                     if !frame.gpu_decoded {
                         cuda_upload(raw_device.ptr, frame.raw_host(), frame.raw_len, *stream)?;
                     }
-                    let mut deb = Self::build_cuda_debayer_job(
-                        red, mode, pixel_type, settings, frame.raw_host(), raw_device.ptr, out_ptr, out_size);
-                    red.process_blocking(*device_id, *stream, &mut deb)
+                    // SAFETY: the frame, `raw_device` and `out` (per
+                    // `GpuOutput`'s contract) outlive this blocking debayer,
+                    // and the lane's stream is valid per `GpuLane::cuda`.
+                    unsafe {
+                        let mut deb = Self::build_cuda_debayer_job(
+                            red, mode, pixel_type, settings, frame.raw_host(), raw_device.ptr, out_ptr, out_size);
+                        red.process_blocking(*device_id, *stream, &mut deb)
+                    }
                 })();
                 if result.is_err() {
                     // The upload may still be landing in `raw_device`.
@@ -868,7 +950,7 @@ impl GpuDecodePipeline {
                 result
             }
             #[cfg(feature = "metal-debayer")]
-            GpuLane::Metal { red, queue } => {
+            Lane::Metal { red, queue } => {
                 let raw_device = shared.acquire_raw_device(frame.raw_len, |size| RawDeviceBuf::metal(*queue, size))?;
                 let result = (|| {
                     if !frame.gpu_decoded {
@@ -881,41 +963,45 @@ impl GpuDecodePipeline {
                     deb.set_mode(mode);
                     deb.set_pixel_type(pixel_type);
                     deb.set_image_processing(settings);
-                    deb.set_raw_host_mem(frame.raw_host());
-                    deb.set_raw_device_mem(raw_device.ptr);
-                    match out {
-                        GpuOutput::DeviceMem  { ptr, size } => deb.set_output_device_mem(ptr, size),
-                        GpuOutput::MetalTexture { texture, size } => deb.set_output_device_image(texture, size),
-                        GpuOutput::OpenClImage { .. } =>
-                            return Err(RedError::Other("Metal lane received GpuOutput::OpenClImage".into())),
-                        GpuOutput::_Lifetime(_) => unreachable!(),
+                    // SAFETY: the frame, `raw_device` and `out` (per
+                    // `GpuOutput`'s contract) outlive this blocking debayer,
+                    // and the lane's queue is valid per `GpuLane::metal`.
+                    unsafe {
+                        deb.set_raw_host_mem(frame.raw_host());
+                        deb.set_raw_device_mem(raw_device.ptr);
+                        match out.0 {
+                            Output::DeviceMem  { ptr, size } => deb.set_output_device_mem(ptr, size),
+                            Output::MetalTexture { texture, size } => deb.set_output_device_image(texture, size),
+                            Output::OpenClImage { .. } =>
+                                return Err(RedError::Other("Metal lane received an OpenCL image output".into())),
+                        }
+                        red.process_blocking(*queue, &mut deb)
                     }
-                    red.process_blocking(*queue, &mut deb)
                 })();
                 shared.release_raw_device(raw_device);
                 result
             }
-            GpuLane::OpenCl { red, ctx, queue } => {
+            Lane::OpenCl { red, ctx, queue } => {
                 // Resolve the destination shape. Two cases:
-                //   1. `DeviceMem` — cl_mem BUFFER, size = output bytes.
+                //   1. Device buffer — cl_mem BUFFER, size = output bytes.
                 //      Tight-packed 6 B/px (`Rgb16bitInterleaved`) or
                 //      4 B/px (`Bgr8bit*`); SDK kernel writes via
                 //      `write_only` pointer stores.
-                //   2. `OpenClImage` — cl_mem IMAGE2D of channel order
+                //   2. OpenCL image — cl_mem IMAGE2D of channel order
                 //      `CL_RGBA` paired with `pixel_type` per
                 //      [`ClImageDataType::expected_pixel_type`]. SDK
                 //      kernel writes via `write_imagef()` — 4-channel
                 //      output with α = 1.0 implicit, no consumer-side
                 //      expand pass needed. Per the OpenCL sample
-                //      (`REDOpenCLGpuDecodeSample.cpp:427`), the SDK's
+                //      (`REDOpenCLGpuDecodeSample.cpp`), the SDK's
                 //      `output_device_mem_size` is `width × height × 4
                 //      × 2` for both `UnormInt16` and `HalfFloat`.
-                let (out_mem, out_size) = match out {
-                    GpuOutput::DeviceMem { ptr, size } => (ptr, size),
+                let (out_mem, out_size) = match out.0 {
+                    Output::DeviceMem { ptr, size } => (ptr, size),
                     #[cfg(feature = "metal-debayer")]
-                    GpuOutput::MetalTexture { .. } =>
-                        return Err(RedError::Other("OpenCL lane received GpuOutput::MetalTexture".into())),
-                    GpuOutput::OpenClImage { image, width, height, data_type } => {
+                    Output::MetalTexture { .. } =>
+                        return Err(RedError::Other("OpenCL lane received a Metal texture output".into())),
+                    Output::OpenClImage { image, width, height, data_type } => {
                         if data_type.expected_pixel_type() != pixel_type {
                             return Err(RedError::Other(format!(
                                 "OpenCL cl_image data_type / pixel_type mismatch: \
@@ -928,10 +1014,9 @@ impl GpuDecodePipeline {
                             .saturating_mul(data_type.bytes_per_pixel());
                         (image, size)
                     }
-                    GpuOutput::_Lifetime(_) => unreachable!(),
                 };
 
-                // `REDOpenCLGpuDecodeSample.cpp:388-395`: clCreateBuffer +
+                // `REDOpenCLGpuDecodeSample.cpp`: clCreateBuffer +
                 // clEnqueueWriteBuffer. The buffer is pooled (no per-frame
                 // clCreateBuffer/clReleaseMemObject churn); the upload stays.
                 let ocl = crate::OPENCL.as_ref()
@@ -954,14 +1039,19 @@ impl GpuDecodePipeline {
                     deb.set_mode(mode);
                     deb.set_pixel_type(pixel_type);
                     deb.set_image_processing(settings);
-                    deb.set_raw_host_mem(frame.raw_host());
-                    deb.set_raw_device_mem(raw_device.ptr);
-                    // Both buffer and cl_image outputs are wired through
-                    // `set_output_device_mem` — the SDK auto-detects the
-                    // cl_mem type via `clGetMemObjectInfo(MEM_TYPE)` and
-                    // routes IMAGE2D writes through `write_imagef()`.
-                    deb.set_output_device_mem(out_mem, out_size);
-                    red.process_blocking(*ctx, *queue, &mut deb)
+                    // SAFETY: the frame, `raw_device` and `out` (per
+                    // `GpuOutput`'s contract) outlive this blocking debayer,
+                    // and the lane's handles are valid per `GpuLane::opencl`.
+                    unsafe {
+                        deb.set_raw_host_mem(frame.raw_host());
+                        deb.set_raw_device_mem(raw_device.ptr);
+                        // Both buffer and cl_image outputs are wired through
+                        // `set_output_device_mem` — the SDK auto-detects the
+                        // cl_mem type via `clGetMemObjectInfo(MEM_TYPE)` and
+                        // routes IMAGE2D writes through `write_imagef()`.
+                        deb.set_output_device_mem(out_mem, out_size);
+                        red.process_blocking(*ctx, *queue, &mut deb)
+                    }
                 })();
                 shared.release_raw_device(raw_device);
                 result
@@ -1129,16 +1219,15 @@ fn cuda_sync(stream: CudaStream) {
 /// **Scope — buffer outputs only.** This function applies the SDK's
 /// 16-pixel dimension rounding which exists *because* flat-buffer
 /// outputs include the SDK's internal row-pitch padding. The
-/// destination-typed outputs ([`GpuOutput::OpenClImage`] and
-/// [`GpuOutput::MetalTexture`]) carry their own row-pitch internally
+/// destination-typed outputs ([`GpuOutput::opencl_image`] and
+/// `GpuOutput::metal_texture`) carry their own row-pitch internally
 /// and are sized at the un-rounded clip dimensions — those paths
 /// **must not** go through `compute_output_size`. The OpenCL cl_image
 /// arm of [`GpuDecodePipeline::run_debayer`] computes its size as
 /// `width × height × data_type.bytes_per_pixel()`
 /// ([`ClImageDataType::bytes_per_pixel`]); the Metal MTLTexture arm
-/// receives the size from its caller (gpu-video computes
-/// `round16(w) × round16(h) × 8` directly, because the MTLTexture's
-/// underlying storage is rounded).
+/// takes the size from its caller, which must account for the
+/// texture's rounded storage (`round16(w) × round16(h) × 8`).
 fn compute_output_size(
     width:      usize,
     height:     usize,
@@ -1215,9 +1304,8 @@ impl<'a> Decompressor<'a> {
 /// when they need to size the texture itself.
 ///
 /// For flat-buffer outputs, callers want
-/// [`compute_output_size`] / [`GpuDecodePipeline::result_frame_size`]
-/// instead — those apply the SDK's 16-pixel rounding **and** multiply
-/// by `bytes_per_pixel`.
+/// [`GpuDecodePipeline::result_frame_size`] instead — it applies the
+/// SDK's 16-pixel rounding **and** multiplies by the bytes per pixel.
 pub fn scaled_dims(width: usize, height: usize, mode: VideoDecodeMode) -> (usize, usize) {
     crate::clip::scaled_dims(width, height, mode)
 }
