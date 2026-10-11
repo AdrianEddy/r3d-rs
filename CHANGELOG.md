@@ -68,5 +68,21 @@ Compared to the unpublished development versions:
   returns an owned `FrameMetadata`. (`Metadata` could be cloned into a
   double free, and default-constructed without the SDK.)
 - `VideoDecodeJob` is private, as no public API consumed it.
+- `AsyncDecoder::decode_for_gpu_sdk` and `GpuDecoder::decode_for_gpu_sdk`
+  size the job's internal buffer for the decoder it goes to: a missing,
+  too small or misaligned one is replaced. The two decoders need different
+  sizes, and `AsyncDecompressJob::allocate_internal_buffer`, now removed,
+  always used the `AsyncDecoder`'s, which the `GpuDecoder` refuses at
+  quarter resolution and below. A job without a loaded clip fails with
+  `RedError::NoClipOpen`.
+- Every submission clears the job's abort request. The SDK never clears it
+  and fails a job submitted with it set, so a job handed back after
+  `CallbackFuture::abort` failed with `RedError::DecodeFailed` when reused.
+  `AsyncDecompressJob::abort` is private; abort through the future
+  (`CallbackFuture::abort`, `gpu::PendingDecompress::abort`). SDK 9.2 ignores
+  an abort request once it has accepted the job, which the docs now say.
+- `AsyncDecompressJob::new` starts in `VideoDecodeMode::FullResPremium`, as
+  `R3dDecodeJob` does. The SDK leaves the mode invalid, so `mode()` panicked
+  on a new job.
 
 [Unreleased]: https://github.com/AdrianEddy/r3d-rs/commits/main

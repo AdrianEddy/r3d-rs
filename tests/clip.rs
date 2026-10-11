@@ -31,9 +31,13 @@ fn clip_without_a_loaded_file() {
     assert!(clip.metadata("bad\0key").is_none());
 
     // A decompress job without a clip is refused before it reaches the SDK.
-    let mut job = r3d_rs::AsyncDecompressJob::new(&sdk);
+    let job = r3d_rs::AsyncDecompressJob::new(&sdk);
     assert_eq!(r3d_rs::AsyncDecoder::size_buffer_needed(&job), 0);
-    assert!(job.allocate_internal_buffer().is_err());
+    assert!(matches!(r3d_rs::AsyncDecoder::new(&sdk, 1).decode_for_gpu_sdk(job), Err(RedError::NoClipOpen)));
+
+    // So is one whose clip has nothing loaded, instead of getting a zero-sized buffer.
+    let mut job = r3d_rs::AsyncDecompressJob::new(&sdk);
+    job.set_clip(&std::sync::Arc::new(Clip::new(&sdk)));
     assert!(matches!(r3d_rs::AsyncDecoder::new(&sdk, 1).decode_for_gpu_sdk(job), Err(RedError::NoClipOpen)));
 
     // The SDK reports a missing file as one it failed to open.

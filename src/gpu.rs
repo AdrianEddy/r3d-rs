@@ -468,10 +468,10 @@ impl DecompressedFrame {
 ///
 /// The decompress job owns its host buffer, and the SDK co-owns the job
 /// until its completion callback, so dropping this before it resolves is
-/// memory-safe — the buffer is freed once the SDK is done with it. To stop
-/// a decode early (e.g. on seek), call [`abort`](Self::abort) and keep
-/// awaiting; the decode then completes promptly with
-/// [`RedError::Cancelled`].
+/// memory-safe — the buffer is freed once the SDK is done with it. To ask
+/// the SDK to stop a decode early (e.g. on seek), call
+/// [`abort`](Self::abort) and keep awaiting; the SDK may finish the decode
+/// anyway.
 pub struct PendingDecompress {
     fut:         CallbackFuture<AsyncDecompressJob>,
     raw_len:     usize,
@@ -479,7 +479,7 @@ pub struct PendingDecompress {
 }
 
 impl PendingDecompress {
-    /// Ask the SDK to abort this decode as soon as possible. See
+    /// Ask the SDK to stop this decode early. Only a hint: see
     /// [`CallbackFuture::abort`].
     pub fn abort(&self) {
         self.fut.abort();

@@ -59,13 +59,13 @@ impl AsyncDecoder {
         cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::AsyncDecoder::ThreadsAvailable(); })
     }
 
-    /// How many bytes the output buffer of `job` must hold, for allocating it
-    /// before the job goes to [`decode_for_gpu_sdk`](AsyncDecoder::decode_for_gpu_sdk).
-    /// [`AsyncDecompressJob::allocate_internal_buffer`] calls this for you.
+    /// How many bytes the output buffer of `job` must hold for this decoder.
+    /// [`decode_for_gpu_sdk`](AsyncDecoder::decode_for_gpu_sdk) sizes the
+    /// job's internal buffer with it; call it to pre-allocate or pool buffers.
+    /// [`GpuDecoder`] needs a different size.
     ///
     /// The result depends on the job's clip and mode, so set both first.
-    /// It is 0 if the job has no clip, its [`Clip`] has nothing loaded, or
-    /// the mode is not valid.
+    /// It is 0 if the job has no clip or its [`Clip`] has nothing loaded.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
         // The SDK requires the job's clip to be set.
         if job.clip.is_none() {
@@ -84,14 +84,19 @@ impl AsyncDecoder {
     /// You should await the returned future to get the status of the decompress operation.
     /// On success, the future gives you back ownership of the job you passed in, so you can re-use it if needed.
     ///
+    /// The job's internal buffer is sized for this decoder, see
+    /// [`AsyncDecompressJob::set_internal_buffer`].
+    ///
     /// # Errors
-    /// Fails right away with [`RedError::NoClipOpen`] if the job has no clip,
-    /// with [`RedError::OutputBufferInvalid`] if it has no output buffer, or
-    /// with the error the SDK reports if it refuses the job. If the decode
-    /// itself fails, the future resolves to that error and the job is dropped.
+    /// Fails right away with [`RedError::NoClipOpen`] if the job has no
+    /// loaded clip, or with the error the SDK reports if it refuses the job,
+    /// e.g. [`RedError::OutputBufferInvalid`] for a buffer passed to
+    /// [`set_output_buffer`](AsyncDecompressJob::set_output_buffer) that is
+    /// too small. If the decode itself fails, the future resolves to that
+    /// error and the job is dropped.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
         let ptr = self.inner.ptr;
-        submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
+        submit_decompress(job, self.inner.clone(), Self::size_buffer_needed, |job_ptr, state_ptr, callback_ptr| {
             cpp!(unsafe [ptr as "R3DSDK::AsyncDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
                 job_ptr->Callback = (R3DSDK::AsyncDecompressJob::AsyncDecompressCallback)callback_ptr;
                 job_ptr->PrivateData = state_ptr;
@@ -160,16 +165,16 @@ impl GpuDecoder {
         status == DecodeStatus::Ok as i32
     }
 
-    /// How many bytes the output buffer of `job` must hold, for allocating it
-    /// before the job goes to [`decode_for_gpu_sdk`](GpuDecoder::decode_for_gpu_sdk).
-    /// [`AsyncDecompressJob::allocate_internal_buffer`] sizes the buffer for
-    /// [`AsyncDecoder`] instead, so for this decoder allocate the buffer
-    /// yourself and pass it to
-    /// [`set_internal_buffer`](AsyncDecompressJob::set_internal_buffer).
+    /// How many bytes the output buffer of `job` must hold for this decoder.
+    /// [`decode_for_gpu_sdk`](GpuDecoder::decode_for_gpu_sdk) sizes the
+    /// job's internal buffer with it; call it to pre-allocate or pool buffers.
+    ///
+    /// This is not the [`AsyncDecoder`]'s size: the frame stays compressed
+    /// until the GPU debayer, so the size can be smaller or larger than the
+    /// [`AsyncDecoder`]'s, depending on the mode.
     ///
     /// The result depends on the job's clip and mode, so set both first.
-    /// It is 0 if the job has no clip, its [`Clip`] has nothing loaded, or
-    /// the mode is not valid.
+    /// It is 0 if the job has no clip or its [`Clip`] has nothing loaded.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
         // The SDK requires the job's clip to be set.
         if job.clip.is_none() {
@@ -188,14 +193,19 @@ impl GpuDecoder {
     /// You should await the returned future to get the status of the decompress operation.
     /// On success, the future gives you back ownership of the job you passed in, so you can re-use it if needed.
     ///
+    /// The job's internal buffer is sized for this decoder, see
+    /// [`AsyncDecompressJob::set_internal_buffer`].
+    ///
     /// # Errors
-    /// Fails right away with [`RedError::NoClipOpen`] if the job has no clip,
-    /// with [`RedError::OutputBufferInvalid`] if it has no output buffer, or
-    /// with the error the SDK reports if it refuses the job. If the decode
-    /// itself fails, the future resolves to that error and the job is dropped.
+    /// Fails right away with [`RedError::NoClipOpen`] if the job has no
+    /// loaded clip, or with the error the SDK reports if it refuses the job,
+    /// e.g. [`RedError::OutputBufferInvalid`] for a buffer passed to
+    /// [`set_output_buffer`](AsyncDecompressJob::set_output_buffer) that is
+    /// too small. If the decode itself fails, the future resolves to that
+    /// error and the job is dropped.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
         let ptr = self.inner.ptr;
-        submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
+        submit_decompress(job, self.inner.clone(), Self::size_buffer_needed, |job_ptr, state_ptr, callback_ptr| {
             cpp!(unsafe [ptr as "R3DSDK::GpuDecoder *", job_ptr as "R3DSDK::AsyncDecompressJob *", state_ptr as "void *", callback_ptr as "void *"] -> i32 as "int" {
                 job_ptr->Callback = (R3DSDK::AsyncDecompressJob::AsyncDecompressCallback)callback_ptr;
                 job_ptr->PrivateData = state_ptr;
@@ -207,18 +217,25 @@ impl GpuDecoder {
 
 /// Hand `job` to the SDK through `submit`, which installs the callback and
 /// private data on the job and returns the SDK status. `decoder` is kept alive
-/// until the job completes.
+/// until the job completes, and `size_buffer_needed` is its buffer size helper.
 fn submit_decompress(
-    job: AsyncDecompressJob,
+    mut job: AsyncDecompressJob,
     decoder: Arc<dyn Send + Sync>,
+    size_buffer_needed: fn(&AsyncDecompressJob) -> usize,
     submit: impl FnOnce(*mut c_void, *mut c_void, *mut c_void) -> i32,
 ) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
-    if job.clip.is_none() {
+    if job.clip.as_ref().is_none_or(|clip| clip.status() != LoadStatus::ClipLoaded) {
         return Err(RedError::NoClipOpen);
     }
+    // The two decoders need different sizes, so the size is only known now.
+    job.fit_internal_buffer(size_buffer_needed(&job))?;
     if !job.has_output_buffer() {
         return Err(RedError::OutputBufferInvalid);
     }
+    // The SDK never clears `AbortDecode`, and fails a job submitted with it
+    // set, so a job handed back after an abort request would fail when
+    // reused. Every submission starts without one, as in RED's samples.
+    job.set_abort_decode(false);
     let job_ptr = job.as_mut_ptr();
     let state = Arc::new(State::new(job, Some(decoder)));
     // Hand the SDK an *owned* refcount (reclaimed in the callback via
@@ -254,9 +271,16 @@ pub struct AsyncDecompressJob {
 // (pinned negative in `tests/send_sync_surface.rs`).
 unsafe impl Send for AsyncDecompressJob {}
 impl AsyncDecompressJob {
-    /// Create an empty job.
+    /// Create a job for frame 0 of the main track, in
+    /// [`VideoDecodeMode::FullResPremium`] like a new
+    /// [`R3dDecodeJob`](crate::R3dDecodeJob). Set its clip before submitting it.
     pub fn new(sdk: &Sdk) -> Self {
-        let ptr = cpp!(unsafe [] -> *mut c_void as "R3DSDK::AsyncDecompressJob *" { return new R3DSDK::AsyncDecompressJob(); });
+        let ptr = cpp!(unsafe [] -> *mut c_void as "R3DSDK::AsyncDecompressJob *" {
+            R3DSDK::AsyncDecompressJob *job = new R3DSDK::AsyncDecompressJob();
+            // The SDK leaves `Mode` at 0, which is not a decode mode.
+            job->Mode = R3DSDK::DECODE_FULL_RES_PREMIUM;
+            return job;
+        });
         Self { ptr, clip: None, internal_buffer: None, metadata_allocated: false, _sdk: sdk.clone() }
     }
     /// Pointer to the underlying `R3DSDK::AsyncDecompressJob`.
@@ -293,12 +317,12 @@ impl AsyncDecompressJob {
         self.clip.as_ref()
     }
 
-    /// Ask the SDK to stop working on this frame at its earliest opportunity.
-    /// To cancel a job that was already submitted, use
-    /// [`CallbackFuture::abort`] on its future.
-    pub fn abort(&mut self) {
+    /// Set the SDK's request to stop decoding this job early. Only meaningful
+    /// while the job is in flight, so it is reached through
+    /// [`CallbackFuture::abort`].
+    fn set_abort_decode(&mut self, abort: bool) {
         let self_ptr = self.ptr;
-        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *"] { self_ptr->AbortDecode = true; })
+        cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", abort as "bool"] { self_ptr->AbortDecode = abort; })
     }
 
     /// The video track to decode: 0 for the main (A) track, or 1 for the
@@ -353,29 +377,46 @@ impl AsyncDecompressJob {
             return self_ptr->OutputBuffer != nullptr && self_ptr->OutputBufferSize != 0;
         })
     }
-    /// Allocate an internal buffer of [`AsyncDecoder::size_buffer_needed`]
-    /// bytes for the output, aligned to 16 bytes. Set the clip and mode first.
-    pub fn allocate_internal_buffer(&mut self) -> RedResult<()> {
-        let size = AsyncDecoder::size_buffer_needed(self);
-        self.set_internal_buffer(AlignedBuffer::new(size, 16)?);
-        Ok(())
-    }
-
     /// Give the job ownership of `buf` and point the output buffer at it,
-    /// replacing any previous internal buffer. `buf` must be 16-byte aligned
-    /// and at least as large as the decoder's `size_buffer_needed`.
+    /// replacing any previous internal buffer. Use this to recycle buffers;
+    /// a job without a buffer gets one when it is submitted.
     ///
     /// The buffer then lives exactly as long as the job. A submitted job is
     /// co-owned by the SDK until its completion callback, so the SDK can never
     /// write into a buffer that was freed under it.
+    ///
+    /// Submitting the job checks the internal buffer against the
+    /// `size_buffer_needed` of the decoder it goes to
+    /// ([`AsyncDecoder::size_buffer_needed`] or
+    /// [`GpuDecoder::size_buffer_needed`], which differ), and replaces a
+    /// missing, smaller or not 16-byte aligned one with a new buffer of
+    /// that size.
     pub fn set_internal_buffer(&mut self, mut buf: AlignedBuffer) {
         // SAFETY: the job owns `buf` from here on, see above.
         unsafe { self.set_output_buffer(buf.as_mut_ptr(), buf.len()) };
         self.internal_buffer = Some(buf);
     }
 
+    /// Before submitting, give the job an internal buffer of `needed` bytes
+    /// unless its current one is large enough and aligned, or the caller set
+    /// its own with [`set_output_buffer`](Self::set_output_buffer), which the
+    /// SDK checks itself. A `needed` of 0 (no loaded clip) changes nothing.
+    fn fit_internal_buffer(&mut self, needed: usize) -> RedResult<()> {
+        let self_ptr = self.ptr;
+        let output: *const c_void = cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> *const c_void as "const void *" {
+            return self_ptr->OutputBuffer;
+        });
+        let internal = self.internal_buffer.as_ref();
+        let caller_owned = !output.is_null() && internal.is_none_or(|buf| buf.as_ptr() != output);
+        let fits = internal.is_some_and(|buf| buf.len() >= needed && (buf.as_ptr() as usize).is_multiple_of(16));
+        if needed != 0 && !caller_owned && !fits {
+            self.set_internal_buffer(AlignedBuffer::new(needed, 16)?);
+        }
+        Ok(())
+    }
+
     /// The buffer set by [`set_internal_buffer`](Self::set_internal_buffer)
-    /// or [`allocate_internal_buffer`](Self::allocate_internal_buffer).
+    /// or allocated when the job was submitted.
     pub fn internal_buffer(&self) -> Option<&AlignedBuffer> {
         self.internal_buffer.as_ref()
     }
@@ -447,19 +488,21 @@ extern "C" fn async_decode_callback(job: *mut c_void /* AsyncDecompressJob * */,
 }
 
 impl CallbackFuture<AsyncDecompressJob> {
-    /// Request the SDK abort this in-flight decode as soon as possible
-    /// (sets `AsyncDecompressJob::AbortDecode`).
+    /// Ask the SDK to stop this in-flight decode early, by setting the job's
+    /// `AbortDecode` flag. No-op once the result has been observed.
     ///
-    /// The SDK still delivers exactly one completion callback per submitted
-    /// job — an aborted frame completes with [`DecodeStatus::Cancelled`] —
-    /// so after `abort()` you must still drive the future to completion
-    /// (await it). **Do not** just drop the future: dropping is memory-safe
-    /// (the SDK co-owns the `State`), but the decode keeps running until it
-    /// finishes or notices the flag, so awaiting is how you reclaim the slot
-    /// promptly. No-op if the result has already been observed.
+    /// The request is only a hint, and the decode may finish anyway: SDK 9.2
+    /// ignores it for every job it has already accepted, so the future then
+    /// resolves to the complete frame as usual. A decode the SDK does stop
+    /// resolves to an error. Either way the SDK completes every job, so keep
+    /// awaiting the future: dropping it is memory-safe (the SDK co-owns the
+    /// job), but the job and its buffer stay in use until the SDK is done.
+    ///
+    /// A job handed back after an abort request can be reused: every
+    /// submission clears the request.
     pub fn abort(&self) {
         if let Some(job) = self.state.job.lock().unwrap().as_mut() {
-            job.abort();
+            job.set_abort_decode(true);
         }
     }
 }

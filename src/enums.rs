@@ -303,8 +303,8 @@ sdk_enum! {
         InvalidPixelType = 11,
         /// HDRx blending was requested, but the clip has no HDRx track.
         NotAnHDRxClip = 12,
-        /// The decode was aborted on request, for example with
-        /// [`AsyncDecompressJob::abort`](crate::AsyncDecompressJob::abort).
+        /// The decode was aborted on request, see
+        /// [`CallbackFuture::abort`](crate::CallbackFuture::abort).
         Cancelled = 13,
         /// The clip's format can't be decoded this way.
         /// [`Clip::check_frame`](crate::Clip::check_frame) also reports this
