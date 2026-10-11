@@ -21,7 +21,7 @@ and decoding RED `.R3D`, Nikon N-RAW (`.NEV`) and R3D NE clips.
 * **Sound lifetimes**: every object keeps the SDK loaded, and asynchronous jobs keep their
   clip, settings and decoder alive until the SDK is done with them.
 * **Proper error handling**, idiomatic iterators and enums.
-* **Native docs**: items are documented based on the official SDK documentation.
+* **Documented properly**: items describe what the SDK does and requires, with links between related items.
 * **Cross-platform**: Windows (x64 and ARM64), Linux (x64), macOS.
 
 Based on **R3D RAW SDK 9.2.1**.

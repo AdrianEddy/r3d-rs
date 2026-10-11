@@ -31,14 +31,15 @@ impl Drop for AsyncDecoderInner {
     }
 }
 
-/// Class for asynchronously decompressing a frame for further processing on the GPU.
+/// Decompresses frames in the background on a pool of CPU threads. The
+/// output is raw sensor data, which a GPU debayer then turns into an image.
 pub struct AsyncDecoder {
     inner: Arc<AsyncDecoderInner>,
 }
 
 impl AsyncDecoder {
-    /// Create and open the asynchronous decoder with the specified number of threads.
-    /// If `threads_no` is 0, [`threads_available`](AsyncDecoder::threads_available) threads will be used.
+    /// Start a decoder with `threads_no` worker threads, or with
+    /// [`threads_available`](AsyncDecoder::threads_available) of them when `threads_no` is 0.
     pub fn new(sdk: &Sdk, threads_no: usize) -> Self {
         let ptr = cpp!(unsafe [threads_no as "size_t"] -> *mut c_void as "R3DSDK::AsyncDecoder *" {
             R3DSDK::AsyncDecoder *ptr = new R3DSDK::AsyncDecoder();
@@ -52,19 +53,19 @@ impl AsyncDecoder {
         self.inner.ptr
     }
 
-    /// Returns the number of threads the decoder will use when created with
-    /// `threads_no` set to 0.
+    /// How many worker threads [`new`](Self::new) starts when given a
+    /// `threads_no` of 0.
     pub fn threads_available(_sdk: &Sdk) -> usize {
         cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::AsyncDecoder::ThreadsAvailable(); })
     }
 
-    /// Returns the size the output buffer of the [`AsyncDecompressJob`] needs
-    /// to be, so the appropriate size buffer can be allocated before calling
-    /// [`decode_for_gpu_sdk`](AsyncDecoder::decode_for_gpu_sdk). The following must be set on input:
-    ///  1) the job's clip must be set to an open [`Clip`]
-    ///  2) the job's mode must be set appropriately
+    /// How many bytes the output buffer of `job` must hold, for allocating it
+    /// before the job goes to [`decode_for_gpu_sdk`](AsyncDecoder::decode_for_gpu_sdk).
+    /// [`AsyncDecompressJob::allocate_internal_buffer`] calls this for you.
     ///
-    /// Returns 0 if these input parameters are invalid or no clip is loaded.
+    /// The result depends on the job's clip and mode, so set both first.
+    /// It is 0 if the job has no clip, its [`Clip`] has nothing loaded, or
+    /// the mode is not valid.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
         // The SDK requires the job's clip to be set.
         if job.clip.is_none() {
@@ -76,11 +77,18 @@ impl AsyncDecoder {
         })
     }
 
-    /// Decompress a frame in to the job's output buffer for further processing on the GPU.
+    /// Queue `job`'s frame to be decompressed into the job's output buffer,
+    /// ready to be handed to a GPU debayer as its raw host memory.
     /// The decompress will be scheduled and the function will immediately return a future.
     ///
     /// You should await the returned future to get the status of the decompress operation.
-    /// The future gives you back ownership of the job you passed in, so you can re-use it if needed.
+    /// On success, the future gives you back ownership of the job you passed in, so you can re-use it if needed.
+    ///
+    /// # Errors
+    /// Fails right away with [`RedError::NoClipOpen`] if the job has no clip,
+    /// with [`RedError::OutputBufferInvalid`] if it has no output buffer, or
+    /// with the error the SDK reports if it refuses the job. If the decode
+    /// itself fails, the future resolves to that error and the job is dropped.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
         let ptr = self.inner.ptr;
         submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
@@ -111,9 +119,14 @@ impl Drop for GpuDecoderInner {
     }
 }
 
-/// Class for asynchronously processing a frame for later decompression
-/// and image processing through CUDA (Windows & Linux) or Metal (macOS).
-/// NOTE: 4GB minimum video RAM recommended when using GPU decode
+/// Like [`AsyncDecoder`], but moves the decompression itself to the GPU.
+///
+/// Its output buffer holds a frame prepared in the background, which the GPU
+/// debayer then both decompresses and processes. This works with the CUDA
+/// (Windows and Linux), Metal (macOS) and OpenCL debayers. Not every clip is
+/// supported, see [`decode_supported_for_clip`](Self::decode_supported_for_clip).
+///
+/// Plan for 4 GB or more of video memory when decoding on the GPU.
 pub struct GpuDecoder {
     inner: Arc<GpuDecoderInner>,
 }
@@ -133,8 +146,12 @@ impl GpuDecoder {
         self.inner.ptr
     }
 
-    /// Determines if the current clip is supported for GPU decompression.
-    /// All clips except for ones recorded on RED ONE are supported.
+    /// Returns `true` if frames of `clip` can be decompressed on the GPU.
+    ///
+    /// Clips shot on a RED ONE are not supported, nor are clips in the
+    /// Nikon N-RAW and R3D NE formats, and SDK 9.2 has no GPU decompression
+    /// on Windows ARM64.
+    /// Decode unsupported clips with [`AsyncDecoder`] instead.
     pub fn decode_supported_for_clip(clip: &Clip) -> bool {
         let clip_ptr = clip.as_mut_ptr();
         let status: i32 = cpp!(unsafe [clip_ptr as "const R3DSDK::Clip *"] -> i32 as "int" {
@@ -143,13 +160,16 @@ impl GpuDecoder {
         status == DecodeStatus::Ok as i32
     }
 
-    /// Returns the size the output buffer of the [`AsyncDecompressJob`] needs
-    /// to be, so the appropriate size buffer can be allocated before calling
-    /// [`decode_for_gpu_sdk`](GpuDecoder::decode_for_gpu_sdk). The following must be set on input:
-    ///  1) the job's clip must be set to an open [`Clip`]
-    ///  2) the job's mode must be set appropriately
+    /// How many bytes the output buffer of `job` must hold, for allocating it
+    /// before the job goes to [`decode_for_gpu_sdk`](GpuDecoder::decode_for_gpu_sdk).
+    /// [`AsyncDecompressJob::allocate_internal_buffer`] sizes the buffer for
+    /// [`AsyncDecoder`] instead, so for this decoder allocate the buffer
+    /// yourself and pass it to
+    /// [`set_internal_buffer`](AsyncDecompressJob::set_internal_buffer).
     ///
-    /// Returns 0 if these input parameters are invalid or no clip is loaded.
+    /// The result depends on the job's clip and mode, so set both first.
+    /// It is 0 if the job has no clip, its [`Clip`] has nothing loaded, or
+    /// the mode is not valid.
     pub fn size_buffer_needed(job: &AsyncDecompressJob) -> usize {
         // The SDK requires the job's clip to be set.
         if job.clip.is_none() {
@@ -161,11 +181,18 @@ impl GpuDecoder {
         })
     }
 
-    /// Prepare a frame for decompression & further processing on the GPU.
+    /// Queue `job`'s frame to be prepared so that the GPU debayer can both
+    /// decompress and process it.
     /// The decompress will be scheduled and the function will immediately return a future.
     ///
     /// You should await the returned future to get the status of the decompress operation.
-    /// The future gives you back ownership of the job you passed in, so you can re-use it if needed.
+    /// On success, the future gives you back ownership of the job you passed in, so you can re-use it if needed.
+    ///
+    /// # Errors
+    /// Fails right away with [`RedError::NoClipOpen`] if the job has no clip,
+    /// with [`RedError::OutputBufferInvalid`] if it has no output buffer, or
+    /// with the error the SDK reports if it refuses the job. If the decode
+    /// itself fails, the future resolves to that error and the job is dropped.
     pub fn decode_for_gpu_sdk(&self, job: AsyncDecompressJob) -> RedResult<CallbackFuture<AsyncDecompressJob>> {
         let ptr = self.inner.ptr;
         submit_decompress(job, self.inner.clone(), |job_ptr, state_ptr, callback_ptr| {
@@ -266,14 +293,17 @@ impl AsyncDecompressJob {
         self.clip.as_ref()
     }
 
-    /// Call this if you want to abort processing this frame as soon as possible
+    /// Ask the SDK to stop working on this frame at its earliest opportunity.
+    /// To cancel a job that was already submitted, use
+    /// [`CallbackFuture::abort`] on its future.
     pub fn abort(&mut self) {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *"] { self_ptr->AbortDecode = true; })
     }
 
-    /// 0 = main (A) track, 1 = EPIC/Scarlet-X highlight protection track 2 (X track),
-    /// ignored when doing HDRx blending
+    /// The video track to decode: 0 for the main (A) track, or 1 for the
+    /// X track, the extra highlight-protection track of HDRx clips shot on
+    /// EPIC/Scarlet-X. There is no HDRx blending on the GPU path.
     pub fn set_video_track_no(&mut self, v: usize) {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "R3DSDK::AsyncDecompressJob *", v as "size_t"] { self_ptr->VideoTrackNo = v; })
@@ -286,14 +316,14 @@ impl AsyncDecompressJob {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> usize as "size_t" { return self_ptr->VideoFrameNo; })
     }
-    /// Resolution/speed to decode the image at. This will also
-    /// influence how much memory is needed for the output buffer
+    /// The decode mode set by [`set_mode`](Self::set_mode).
     pub fn mode(&self) -> VideoDecodeMode {
         let self_ptr = self.ptr;
         enum_from_sdk(cpp!(unsafe [self_ptr as "const R3DSDK::AsyncDecompressJob *"] -> i32 as "int" { return (int)self_ptr->Mode; }))
     }
-    /// Resolution/speed to decode the image at. This will also
-    /// influence how much memory is needed for the output buffer
+    /// Pick the resolution and quality, and so the speed, of the decode.
+    /// The mode changes the output buffer size, so set it before sizing or
+    /// allocating the buffer.
     pub fn set_mode(&mut self, v: VideoDecodeMode) {
         let v: i32 = v as i32;
         let self_ptr = self.ptr;
@@ -305,8 +335,8 @@ impl AsyncDecompressJob {
     /// buffer alive for as long as the SDK may write to it.
     ///
     /// # Safety
-    /// `buf` must be valid for writes of `size` bytes and aligned on a 16-byte
-    /// boundary until every decode of this job has completed: until the future
+    /// `buf` must be 16-byte aligned and valid for writes of `size` bytes
+    /// until every decode of this job has completed: until the future
     /// returned by `decode_for_gpu_sdk` resolves, or, if it is dropped first,
     /// until the SDK is done with the job, which is only known once the job
     /// itself is dropped.
@@ -374,7 +404,8 @@ impl AsyncDecompressJob {
             self_ptr->OutputFrameMetadata = new R3DSDK::Metadata();
         })
     }
-    /// The decoded frame's per-frame metadata, if
+    /// The metadata the SDK recorded for the frame this job decoded. Fails
+    /// with [`RedError::Other`] unless
     /// [`allocate_frame_metadata`](Self::allocate_frame_metadata) was called.
     pub fn metadata(&self) -> RedResult<&Metadata> {
         if !self.metadata_allocated {

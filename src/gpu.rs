@@ -314,9 +314,9 @@ struct LaneShared {
     raw_device_pool: Mutex<Vec<RawDeviceBuf>>,
     /// CUDA debayer streams for the async (`process_async`) path — one
     /// per concurrently in-flight debayer, indexed by the caller's
-    /// `stream_slot`. The SDK keys its per-frame internal object mapping
-    /// on `(deviceId, stream)` (`R3DSDKCuda.h`: "deviceId and
-    /// stream are used as tokens for internal object mapping"), so two
+    /// `stream_slot`. The SDK looks up its per-frame internal objects
+    /// by the `(deviceId, stream)` pair (see the `REDCuda::process`
+    /// notes in `R3DSDKCuda.h`), so two
     /// concurrent `processAsync` jobs MUST run on distinct streams or
     /// they collide. RED's own sample round-robins `NUM_STREAMS`
     /// (`REDCudaGpuDecodeSample.cpp`). Each slot is marked busy
@@ -895,9 +895,10 @@ impl GpuDecodePipeline {
         job
     }
 
-    // `raw_device_mem` must hold "the same data as raw_host_mem except
-    // already on the GPU" (`R3DSDKCuda.h`), and "Upload the result buffer
-    // to the GPU" is step 2 of both GPU modes in "How to use the SDK.txt".
+    // `raw_device_mem` is meant to be a GPU-resident copy of
+    // `raw_host_mem` (`R3DSDKCuda.h`), and copying the decompressed frame
+    // to the device is the second step of both GPU workflows in
+    // "How to use the SDK.txt".
     // For the AsyncDecoder every lane uploads it, as RED's
     // `RED{Cuda,Metal,OpenCL}Sample` do — without the upload the CUDA
     // debayer silently returns a black frame. RED's CUDA and Metal

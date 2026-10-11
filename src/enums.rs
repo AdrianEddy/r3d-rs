@@ -9,129 +9,159 @@ bitflags! {
         const None = 0;
         const Cuda = 0x01;
         const OpenCL = 0x02;
-        /// Exclusive: do not combine with `Cuda`, `OpenCL` or `Metal`.
+        /// Load the R3DDecoder library. This flag is exclusive: pass it
+        /// without `Cuda`, `OpenCL` or `Metal`.
         const R3DDecoder = 0x04;
-        /// macOS only
+        /// Available on macOS only.
         const Metal = 0x08;
-        /// OpenCL only: don't pre-compile kernels in [`RedOpenCl::check_compatibility`](crate::RedOpenCl::check_compatibility), instead compile them when needed
+        /// Only affects OpenCL. Skips building the GPU kernels up front in
+        /// [`RedOpenCl::check_compatibility`](crate::RedOpenCl::check_compatibility)
+        /// and builds each one on demand instead.
         const DelayGpuCompile = 0x10;
     }
 }
 
 sdk_enum! {
+    /// File format of a clip.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum FileId {
-        /// unknown/can't open or read
+        /// Not a recognized format, or the file could not be opened or read.
         Unknown = 0,
-        /// original .R3D with multi-file/spanning clips (A001_C001_1231XY_001...999.R3D, A001_C002_1231XY_001...999.R3D, etc.)
+        /// RED's original `.R3D` format. One clip may span several numbered
+        /// files, e.g. `A001_C001_1231XY_001.R3D`, `A001_C001_1231XY_002.R3D`.
         R3D = 1,
-        /// Nikon .NEV N-RAW with single file per clip (DSC_0001.NEV, DSC_0002.NEV, etc.)
+        /// Nikon N-RAW. Every `.NEV` file is a separate clip, e.g. `DSC_0001.NEV`.
         NevNraw = 3,
-        /// .R3D with single file per clip (DSC_0001.R3D, DSC_0002.R3D, etc.)
+        /// Nikon R3D NE. Every `.R3D` file is a separate clip, e.g. `DSC_0001.R3D`.
         R3dNe = 4,
     }
 }
 
 sdk_enum! {
+    /// Role of a file that belongs to a clip.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum FileType {
-        /// invalid file index
+        /// The file index is out of range.
         Invalid = 0,
 
-        // Files that are part of the clip itself, there's always at least 1 of these
-        /// .R3D or .NEV
+        // Media that makes up the clip. Every clip has one or more of these.
+        /// A `.R3D` or `.NEV` media file.
         Clip = 1,
 
-        // Optional sidecar / external files
-        /// .RMD or .cdl
+        // Sidecar files stored next to the clip. Any of them may be missing.
+        /// A `.RMD` or `.cdl` metadata sidecar.
         Metadata = 2,
-        /// .cube
+        /// A `.cube` LUT.
         Lut = 3,
-        /// .wav
+        /// A `.wav` audio file.
         Audio = 5,
     }
 }
 
 sdk_enum! {
-    /// The different resolutions and qualities the clip can be
-    /// decoded at. This list expand over time.
+    /// Resolution and quality to decode at. Premium modes are slow and give
+    /// the best image the SDK can produce. Good modes are fast; their output
+    /// is very good at half and quarter resolution and good at smaller sizes.
+    /// Later SDK releases may add more modes.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum VideoDecodeMode {
-        /// 'DFRP', full resolution, slow, but highest resolution & quality
+        /// Full resolution, premium (slow). FourCC `DFRP`.
         FullResPremium   = 0x44465250,
-        /// 'DHRP', half resolution, slow, but highest quality
+        /// Half resolution, premium (slow). FourCC `DHRP`.
         HalfResPremium   = 0x44485250,
-        /// 'DHRG', half resolution, fast, still very good quality
+        /// Half resolution, good (fast). FourCC `DHRG`.
         HalfResGood      = 0x44485247,
-        /// 'DQRG', quarter resolution, fast, very good quality
+        /// Quarter resolution, good (fast). FourCC `DQRG`.
         QuarterResGood   = 0x44515247,
-        /// 'DERG', eight resolution, fast, good quality
+        /// One-eighth resolution, good (fast). FourCC `DERG`.
         EightResGood     = 0x44455247,
-        /// 'DSRG', sixteenth resolution, fast, good quality
+        /// One-sixteenth resolution, good (fast). FourCC `DSRG`.
         SixteenthResGood = 0x44535247,
     }
 }
 
 sdk_enum! {
-    /// The different pixel types to decode images at. The 16-bit RGB
-    /// planar format has always existed in the SDK but is not supported
-    /// for RED Rocket decoding. The other two formats are interleaved
-    /// and are supported for both software and RED Rocket decoding.
+    /// Pixel format to decode into. CPU decodes accept every variant. GPU
+    /// decodes accept only [`Rgb16bitInterleaved`](Self::Rgb16bitInterleaved),
+    /// [`RgbHalfFloatInterleaved`](Self::RgbHalfFloatInterleaved) and
+    /// [`RgbHalfFloatAcesInt`](Self::RgbHalfFloatAcesInt).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum VideoPixelType {
-        /// Interleaved RGB decoding in 16-bits per pixel. 4K decodes in this 16-bit pixel type using the Rocket will not be real time.
-        /// Use the 12- or 10-bit pixel types below for 4K real time needs
-        /// Supported by software and RED Rocket decode
+        /// Interleaved RGB with a 16-bit unsigned integer per channel. CPU and GPU.
         Rgb16bitInterleaved     = 0x52423649,
-        /// 16-bit half-float decoding. These ImageProcessingSettings fields are ignored:
-        /// - GammaCurve (will always be linear)
-        /// - Contrast
-        /// - Brightness
-        /// - Saturation
-        /// - RGB gains
-        /// - Shadow
-        /// - UserCurve, UserCurveRed, UserCurveGreen & UserCurveBlue
-        /// - LggRed, LggGreen & LggBlue
-        /// - CustomPDLogBlackPoint, CustomPDLogWhitePoint & CustomPDLogGamma
+        /// Interleaved RGB with a 16-bit half float per channel. CPU and GPU.
+        /// The output is always linear, and these [`ImageProcessingSettings`]
+        /// have no effect:
+        /// - [`set_gamma_curve`]
+        /// - [`set_contrast`], [`set_brightness`] and [`set_saturation`]
+        /// - [`set_gain_red`], [`set_gain_green`] and [`set_gain_blue`]
+        /// - [`set_shadow`]
+        /// - all user curves ([`user_curve_mut`] and the red, green and blue
+        ///   variants)
+        /// - lift/gamma/gain ([`lgg_red_mut`] and the green and blue variants)
+        /// - the CDL ([`set_cdl_saturation`], [`cdl_red_mut`] and the green and
+        ///   blue variants, [`set_cdl_enabled`])
+        /// - the custom PDlog parameters ([`set_custom_pdlog_black_point`],
+        ///   [`set_custom_pdlog_white_point`], [`set_custom_pdlog_gamma`])
+        ///
+        /// [`ImageProcessingSettings`]: crate::ImageProcessingSettings
+        /// [`set_gamma_curve`]: crate::ImageProcessingSettings::set_gamma_curve
+        /// [`set_contrast`]: crate::ImageProcessingSettings::set_contrast
+        /// [`set_brightness`]: crate::ImageProcessingSettings::set_brightness
+        /// [`set_saturation`]: crate::ImageProcessingSettings::set_saturation
+        /// [`set_gain_red`]: crate::ImageProcessingSettings::set_gain_red
+        /// [`set_gain_green`]: crate::ImageProcessingSettings::set_gain_green
+        /// [`set_gain_blue`]: crate::ImageProcessingSettings::set_gain_blue
+        /// [`set_shadow`]: crate::ImageProcessingSettings::set_shadow
+        /// [`user_curve_mut`]: crate::ImageProcessingSettings::user_curve_mut
+        /// [`lgg_red_mut`]: crate::ImageProcessingSettings::lgg_red_mut
+        /// [`set_cdl_saturation`]: crate::ImageProcessingSettings::set_cdl_saturation
+        /// [`cdl_red_mut`]: crate::ImageProcessingSettings::cdl_red_mut
+        /// [`set_cdl_enabled`]: crate::ImageProcessingSettings::set_cdl_enabled
+        /// [`set_custom_pdlog_black_point`]: crate::ImageProcessingSettings::set_custom_pdlog_black_point
+        /// [`set_custom_pdlog_white_point`]: crate::ImageProcessingSettings::set_custom_pdlog_white_point
+        /// [`set_custom_pdlog_gamma`]: crate::ImageProcessingSettings::set_custom_pdlog_gamma
         RgbHalfFloatInterleaved = 0x52424846,
-        /// 16-bit half-float ACES decoding. These ImageProcessingSettings fields are ignored:
-        /// - Same fields as the `RgbHalfFloatInterleaved` pixel type
-        /// - ColorSpace (will always be set to ACES AP0)
+        /// ACES flavor of [`RgbHalfFloatInterleaved`](Self::RgbHalfFloatInterleaved),
+        /// also CPU and GPU. It ignores the same settings, and the color space
+        /// is fixed to ACES AP0, so
+        /// [`set_color_space`](crate::ImageProcessingSettings::set_color_space)
+        /// has no effect either.
         RgbHalfFloatAcesInt     = 0x52424841,
-        /// Planar RGB decoding in 16-bits per pixel
-        /// Supported by software decode only
+        /// Planar RGB with a 16-bit unsigned integer per channel: one full plane
+        /// per channel. CPU only. Older SDK versions decoded to this format.
         Rgb16bitPlanar          = 0x52423650,
-        /// Interleaved BGR 8-bit
+        /// Interleaved BGR with 8 bits per channel. CPU only.
         Bgr8bitInterleaved      = 0x42475238,
-        /// Interleaved BGRA decoding in 8 bits per pixel, alpha channel = 0xFF
+        /// Interleaved BGRA with 8 bits per channel; alpha is always 0xFF. CPU only.
         Bgra8bitInterleaved     = 0x42524138,
-        /// Interleaved RGB 10-bit DPX Method B
+        /// 10-bit RGB in DPX Method B packing. CPU only.
         Dpx10bitMethodB         = 0x44503042,
     }
 }
 
 sdk_enum! {
-    /// HDRx blending algorithm to use when doing HDR blending
+    /// How the two exposures of an HDRx clip are merged. Chosen with
+    /// [`HdrProcessingSettings::set_hdr_blend_algorithm`](crate::HdrProcessingSettings::set_hdr_blend_algorithm).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum HdrBlendAlgorithm {
-        /// Simple blend, exactly as implemented in the SDK's 12_SimpleHDRxBlend sample.
-        /// On the Rocket this will ALWAYS decode in 16-bit to do the blend
-        /// This can result in slow downs at full resolution. If you need a
-        /// preview option in 8-bit then decode 2 images in 8-bit and
-        /// implement the simple blend as per sample code 12_SimpleHDRxBlend
+        /// Per-pixel weighted mix of the two tracks. It is the same algorithm
+        /// the SDK sample `CPUSimpleHDRxBlendSample.cpp` implements by hand.
         HDRxSimpleBlend = 0x48445253,
-        /// Magic Motion, more sophisticated blend
+        /// RED's Magic Motion blend, which is more involved than
+        /// [`HDRxSimpleBlend`](Self::HDRxSimpleBlend).
         HDRxMagicMotion = 0x4844524D,
     }
 }
 
 sdk_enum! {
-    /// HDR read status & write setting when reading & writing RMD sidecar files
+    /// HDRx handling recorded in, or read from, an RMD sidecar file.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum HdrMode {
-        /// Use A / main (#0) or X (#1) track
+        /// Show a single track: 0 is the main A track, 1 is the X track.
         UseTrackNo = 0,
-        /// Blend A and X tracks using specified settings
+        /// Merge the A and X tracks according to the
+        /// [`HdrProcessingSettings`](crate::HdrProcessingSettings).
         DoBlend = 1,
     }
 }
@@ -181,149 +211,167 @@ sdk_enum! {
 }
 
 sdk_enum! {
-    /// Clip load status
+    /// Outcome of loading a clip, as reported by [`Clip::status`](crate::Clip::status).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum LoadStatus {
         ClipLoaded = 0,
-        /// could not find the clip
+        /// Nothing exists at the given path.
         PathNotFound = 1,
-        /// could not open the clip
+        /// The clip file exists but could not be opened.
         FailedToOpenFile = 2,
-        /// clip does not appear to be a(n) (valid) R3D file
+        /// The file is not an R3D clip the SDK recognizes as valid.
         NotAnR3DFile = 3,
-        /// clip doesn't have any video frames in it
+        /// The clip contains no video frames.
         ClipIsEmpty = 4,
-        /// no more memory could be allocated
+        /// A memory allocation failed.
         OutOfMemory = 5,
-        /// unknown error (shouldn't happen)
+        /// An unexpected internal error.
         UnknownError = 6,
-        /// initial status, no clip has been loaded yet
+        /// Nothing has been loaded yet. A new clip starts in this state.
         NoClipOpen = 7,
-        /// library wasn't loaded properly
+        /// The SDK libraries are not set up correctly.
         NotInitialized = 8,
     }
 }
 
 sdk_enum! {
-    /// Clip create status
+    /// Progress and result codes for writing a new clip (trim or snapshot).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum CreateStatus {
-        /// trim has started but has not finished yet
+        /// The trim is underway.
         Started = 0,
-        /// a frame has been added to the output clip, but not finished yet
+        /// Progress report: another frame has been written and the trim is
+        /// still running.
         FrameAdded = 1,
-        /// trim is done
+        /// The trim completed.
         Done = 2,
-        /// no more memory could be allocated
+        /// A memory allocation failed.
         OutOfMemory = 3,
-        /// the requested start or end frame does not exist in the clip
+        /// The start or end frame lies outside the source clip.
         RequestOutOfRange = 4,
         InvalidParameter = 5,
-        /// unable to load a frame from the source clip
+        /// Reading a source frame failed, for example because it is a dropped
+        /// frame.
         FailedToGetSourceFrame = 6,
-        /// unable to create output clip
+        /// The output clip could not be created.
         FailedToCreateDestination = 7,
-        /// unable to write to output clip
+        /// Writing to the output clip failed.
         FailedToWriteToDestination = 8,
         UnknownError = 9,
-        /// source clip cannot be used for trim (RED ONE firmware build 15 and below not supported)
+        /// This source clip can't be trimmed. RED ONE footage shot on
+        /// firmware build 15 or earlier is not supported.
         InvalidSourceClip = 10,
-        /// output path is invalid (see trim requirements)
+        /// The output path doesn't meet the SDK's trim requirements.
         InvalidPath = 11,
-        /// unable to load needed audio samples form source clip
+        /// Reading the source clip's audio failed.
         FailedToGetSourceAudio = 12,
-        /// streaming packets need to be added in order
+        /// Stream packets arrived out of order.
         OutOfOrder = 13,
-        /// streaming packet is invalid
+        /// A stream packet is malformed.
         InvalidStream = 14,
     }
 }
 
 sdk_enum! {
-    /// Video decode status
+    /// Outcome of decoding a video frame. Failures surface as the matching
+    /// [`RedError`](crate::RedError).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum DecodeStatus {
         Ok = 0,
-        /// null pointer, too small or not aligned
+        /// The output buffer is missing, smaller than the frame needs, or
+        /// misaligned.
         OutputBufferInvalid = 1,
-        /// the requested frame does not exist in the clip
+        /// The frame number is outside the clip.
         RequestOutOfRange = 3,
-        /// one of the supplied parameters is not valid
+        /// A parameter has an invalid value.
         InvalidParameter = 4,
-        /// the requested frame is a dropped frame and can't be decoded (video decode only)
+        /// The frame is marked as dropped, so there is no image to decode.
+        /// Only video decodes report this.
         IsDroppedFrame = 5,
-        /// decode failed because of a corrupt frame
+        /// The frame is corrupt. [`Clip::check_frame`](crate::Clip::check_frame)
+        /// also reports this when a frame's CRC doesn't match.
         DecodeFailed = 6,
-        /// no more memory could be allocated
+        /// A memory allocation failed.
         OutOfMemory = 7,
-        /// unknown error (shouldn't happen)
+        /// An unexpected internal error.
         UnknownError = 8,
-        /// open a clip first before trying to decode a frame
+        /// Decoding was attempted before any clip was loaded.
         NoClipOpen = 9,
-        /// I/O error reading the frame
+        /// An I/O failure prevented the frame from being read.
         CannotReadFromFile = 10,
-        /// cannot decode to specified pixel type
+        /// This decode can't produce the requested [`VideoPixelType`].
         InvalidPixelType = 11,
-        /// cannot decode HDRx as this is not an HDRx clip
+        /// HDRx blending was requested, but the clip has no HDRx track.
         NotAnHDRxClip = 12,
-        /// user requested decode to be cancelled
+        /// The decode was aborted on request, for example with
+        /// [`AsyncDecompressJob::abort`](crate::AsyncDecompressJob::abort).
         Cancelled = 13,
-        /// this clip format is not supported for the requested decode
+        /// The clip's format can't be decoded this way.
+        /// [`Clip::check_frame`](crate::Clip::check_frame) also reports this
+        /// when the clip or frame has no CRC.
         UnsupportedClipFormat = 14,
-        /// one of the parameters supplied is not supported by this API. Upgrade to newer dynamic libraries.
+        /// The loaded SDK libraries don't know one of the parameters. Newer
+        /// redistributable libraries may be needed.
         ParameterUnsupported = 15,
-        /// open async decoder first before submitting decodes
+        /// Jobs were submitted to a decoder that was never opened.
         DecoderNotOpened = 16,
     }
 }
 
 sdk_enum! {
+    /// Status codes of the [`R3dDecoder`](crate::R3dDecoder) API. Failures
+    /// surface as the matching [`RedError`](crate::RedError).
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum R3DStatus {
         Ok = 0,
         ErrorProcessing = 1,
         InvalidJobParameter = 2,
 
-        /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+        /// The decode mode is unsupported by this SDK, or differs from the
+        /// mode used when the frame went through
+        /// [`AsyncDecoder::decode_for_gpu_sdk`](crate::AsyncDecoder::decode_for_gpu_sdk).
         InvalidJobParameterMode = 3,
 
-        /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+        /// The raw host buffer is null, wasn't produced by `decode_for_gpu_sdk`,
+        /// doesn't actually live in host memory, or the R3D SDK and GPU SDK
+        /// library versions don't match.
         InvalidJobParameterRawHostMem = 4,
         InvalidJobParameterRawDeviceMem = 5,
 
-        /// unsupported pixel type
+        /// The pixel type can't be used here.
         InvalidJobParameterPixelType = 6,
 
-        /// Output buffer Size must be non zero.
-        /// Output buffer must be allocated prior to passing it into the sdk
+        /// The output buffer has a size of zero, or it wasn't allocated before
+        /// the job was submitted.
         InvalidJobParameterOutputDeviceMemSize = 7,
         InvalidJobParameterOutputDeviceMem = 8,
 
-        /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+        /// The image processing settings request [`ColorVersion::Version1`],
+        /// which this decoder can't use.
         InvalidJobParameterColorVersion1 = 9,
 
-        /// null, or unopened clip.
+        /// The job has no clip, or its clip isn't open.
         InvalidJobParameterClip = 10,
 
-        /// GPU Device did not meet minimum requirements.
+        /// The selected GPU falls short of the SDK's minimum requirements.
         UnableToUseGPUDevice = 11,
 
-        /// No GPU Devices were setup on the R3DDecoderOptions class
+        /// No GPU was added to the [`R3dDecoderOptions`](crate::R3dDecoderOptions).
         NoGPUDeviceSpecified = 12,
 
-        /// Error loading R3DSDK dynamic library
+        /// Loading the R3D SDK dynamic library failed.
         UnableToLoadLibrary = 13,
         ParameterUnsupported = 14,
     }
 }
 
 sdk_enum! {
-    /// Possible marker types
+    /// Kind of marker stored in a clip.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum MarkerType {
-        /// region, most likely has different start & end frame numbers
+        /// A span of frames. Its end frame is normally later than its start.
         SubClip = 0,
-        /// single frame marker, start & end frame number will be the same
+        /// Points at one frame (start equals end).
         StillFrame = 1,
     }
 }
@@ -336,42 +384,49 @@ sdk_enum! {
 
         HDR2084 = 14,
         BT1886 = 15,
-        /// mid grey point maps to 1/3, encodes 12 stops above mid grey
+        /// Log curve that puts mid grey at 1/3 of the output range and keeps
+        /// 12 stops of headroom above it.
         Log3G12 = 16,
-        /// mid grey point maps to 1/3, encodes 10 stops above mid grey
+        /// Log curve that puts mid grey at 1/3 of the output range and keeps
+        /// 10 stops of headroom above it.
         Log3G10 = 18,
-        /// only available with color version 2 or newer, otherwise ignored (REDlog will be used)
+        /// Needs [`ColorVersion::Version2`] or later. Older versions fall back
+        /// to [`REDlog`](Self::REDlog).
         REDlogFilm = 9,
 
-        // Only for IPP2 (ColorVersion3)
-        /// color version 3+
+        // IPP2 curves (ColorVersion3).
+        /// Needs [`ColorVersion::Version3`] or later.
         HybridLogGamma = 19,
-        /// color version 3+
+        /// Needs [`ColorVersion::Version3`] or later.
         Gamma2_2 = 20,
-        /// color version 3+
+        /// Needs [`ColorVersion::Version3`] or later.
         Gamma2_6 = 21,
 
-        // Only for Legacy (ColorVersion2), deprecated and not available in IPP2 decode mode.
-        /// BT1886 will be used in IPP2 mode.
+        // Legacy curves (ColorVersion2). Deprecated, and IPP2 decodes can't use them.
+        /// IPP2 decodes substitute [`BT1886`](Self::BT1886).
         Rec709 = 1,
-        /// v4: only available with color version 2, otherwise ignored
+        /// REDgamma version 4. Takes effect only with [`ColorVersion::Version2`].
         REDgamma4 = 12,
 
-        // Below gamma curves are deprecated and not available in IPP2 decode mode, only for ColorVersion2.
+        // Also legacy-only (ColorVersion2) and deprecated:
         PDlog685 = 4,
         PDlog985 = 5,
-        /// if used CustomPDLogBlackPoint, WhitePoint & Gamma must be set!
+        /// Custom PDlog curve. Requires setting the black point, white point
+        /// and gamma too, with
+        /// [`set_custom_pdlog_black_point`](crate::ImageProcessingSettings::set_custom_pdlog_black_point),
+        /// [`set_custom_pdlog_white_point`](crate::ImageProcessingSettings::set_custom_pdlog_white_point)
+        /// and [`set_custom_pdlog_gamma`](crate::ImageProcessingSettings::set_custom_pdlog_gamma).
         CustomPDlog = 6,
 
-        /// only available with color version 2, otherwise ignored
+        /// Takes effect only with [`ColorVersion::Version2`].
         REDspace = 2,
-        /// only available with color version 2, otherwise ignored
+        /// Takes effect only with [`ColorVersion::Version2`].
         REDlog = 3,
-        /// v1: only available with color version 2, otherwise ignored
+        /// REDgamma version 1. Takes effect only with [`ColorVersion::Version2`].
         REDgamma = 7,
-        /// v2: only available with color version 2, otherwise ignored
+        /// REDgamma version 2. Takes effect only with [`ColorVersion::Version2`].
         REDgamma2 = 10,
-        /// v3: only available with color version 2, otherwise ignored
+        /// REDgamma version 3. Takes effect only with [`ColorVersion::Version2`].
         REDgamma3 = 11,
     }
 }
@@ -379,82 +434,94 @@ sdk_enum! {
 sdk_enum! {
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ImageColorSpace {
-        /// only available with color version 2 or newer, otherwise ignored (CameraRGB will be used)
+        /// Needs [`ColorVersion::Version2`] or later. Older versions fall back
+        /// to [`CameraRGB`](Self::CameraRGB).
         REDWideGamutRGB = 15,
 
-        /// only available with color version 2 or newer, otherwise ignored (REDspace will be used)
+        /// Needs [`ColorVersion::Version2`] or later. Older versions fall back
+        /// to [`REDspace`](Self::REDspace).
         Rec2020 = 13,
         Rec709 = 1,
         SRGB = 4,
         Adobe1998 = 5,
-        /// only available with color version 2 or newer
+        /// Needs [`ColorVersion::Version2`] or later.
         DCIP3 = 16,
-        /// only available with color version 2 or newer
+        /// Needs [`ColorVersion::Version2`] or later.
         ProPhotoRGB = 17,
 
-        // Only for IPP2 (ColorVersion3)
-        /// only available with color version 3 or newer
+        // IPP2 color spaces (ColorVersion3).
+        /// Needs [`ColorVersion::Version3`] or later.
         DCIP3D65 = 18,
 
-        // Only for Legacy (ColorVersion2), deprecated and not available in IPP2 decode mode.
-        /// v2: only available with color version 2, otherwise ignored
+        // Legacy color spaces (ColorVersion2). Deprecated, and IPP2 decodes can't use them.
+        /// DRAGONcolor version 2. Takes effect only with [`ColorVersion::Version2`].
         DRAGONcolor2 = 12,
-        /// v4: only available with color version 2, otherwise ignored
+        /// REDcolor version 4. Takes effect only with [`ColorVersion::Version2`].
         REDcolor4 = 11,
 
-        // Below color spaces are deprecated and not available in IPP2 decode mode, only for ColorVersion2.
+        // Also legacy-only (ColorVersion2) and deprecated:
         CameraRGB = 0,
         REDspace = 2,
-        /// v1: only available with color version 2, otherwise ignored
+        /// REDcolor version 1. Takes effect only with [`ColorVersion::Version2`].
         REDcolor = 3,
-        /// v2: only available with color version 2, otherwise ignored
+        /// REDcolor version 2. Takes effect only with [`ColorVersion::Version2`].
         REDcolor2 = 6,
-        /// v3: only available with color version 2, otherwise ignored
+        /// REDcolor version 3. Takes effect only with [`ColorVersion::Version2`].
         REDcolor3 = 8,
-        /// v1: only available with color version 2, otherwise ignored
+        /// DRAGONcolor version 1. Takes effect only with [`ColorVersion::Version2`].
         DRAGONcolor = 9,
     }
 }
 
 sdk_enum! {
-    /// IPP2 (ColorVersion3) only
+    /// Pipeline mode for IPP2 ([`ColorVersion::Version3`]) decodes.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ImagePipeline {
-        /// output in REDWideGamutRGB & Log3G10. Only Kelvin, Tint, ISO and ExposureAdjust available.
+        /// Stop after primary development. The image comes out as
+        /// REDWideGamutRGB with the Log3G10 curve, and only [`set_kelvin`],
+        /// [`set_tint`], [`set_iso`] and [`set_exposure_adjust`] have any effect.
+        ///
+        /// [`set_kelvin`]: crate::ImageProcessingSettings::set_kelvin
+        /// [`set_tint`]: crate::ImageProcessingSettings::set_tint
+        /// [`set_iso`]: crate::ImageProcessingSettings::set_iso
+        /// [`set_exposure_adjust`]: crate::ImageProcessingSettings::set_exposure_adjust
         PrimaryDevelopmentOnly = 0,
-        /// default
+        /// The complete IPP2 pipeline, including grading. This is the default.
         FullGraded = 1,
     }
 }
 
 sdk_enum! {
-    /// IPP2 (ColorVersion3) only
+    /// Highlight roll-off for IPP2 ([`ColorVersion::Version3`]) decodes.
+    /// Ignored while a log gamma curve is in use.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum RollOff {
         VerySoft = 4,
         Soft = 3,
         Medium = 2,
         Hard = 1,
-        /// advanced option
+        /// No roll-off. Meant for advanced users.
         None = 0,
     }
 }
 
 sdk_enum! {
-    /// IPP2 (ColorVersion3) only
+    /// Lens distortion correction for IPP2 ([`ColorVersion::Version3`]) decodes.
+    /// Only full and half resolution premium decodes apply it.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum LensCorrection {
-        /// follow metadata (user has not overridden the setting)
+        /// Do what the clip metadata says. This is the state while the user
+        /// hasn't overridden it.
         Auto = 0,
-        /// force correction on, if correction metadata is present
+        /// Always correct, provided the clip carries correction metadata.
         On = 1,
-        /// force correction off
+        /// Never correct.
         Off = 2,
     }
 }
 
 sdk_enum! {
-    /// IPP2 (ColorVersion3) only
+    /// Output tone mapping strength for IPP2 ([`ColorVersion::Version3`]) decodes.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ToneMap {
         Low = 0,
@@ -465,20 +532,23 @@ sdk_enum! {
 }
 
 sdk_enum! {
-    /// Amount of detail extraction (not sharpening!) for
-    /// the full resolution premium software decode only!
+    /// Level of detail extraction, which is distinct from sharpening. Only
+    /// CPU decodes in [`VideoDecodeMode::FullResPremium`] use it, and
+    /// [`ColorVersion::Version3`] and [`ColorVersion::VersionBC`] ignore it.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ImageDetail {
         Low = 0,
         Medium = 1,
-        /// default
+        /// The default.
         High = 2,
     }
 }
 
 sdk_enum! {
-    /// Compensation for the OLPF (low-pass) filter for
-    /// the half & full resolution premium software decodes
+    /// Strength of the correction for the camera's optical low-pass filter
+    /// (OLPF). Only CPU decodes in [`VideoDecodeMode::FullResPremium`] and
+    /// [`VideoDecodeMode::HalfResPremium`] use it, and
+    /// [`ColorVersion::Version3`] and [`ColorVersion::VersionBC`] ignore it.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ImageOLPFCompensation {
         Off = 0,
@@ -489,8 +559,9 @@ sdk_enum! {
 }
 
 sdk_enum! {
-    /// Amount of noise reduction to do for the
-    /// full resolution premium software decode
+    /// Noise reduction strength. Only CPU decodes in
+    /// [`VideoDecodeMode::FullResPremium`] use it, and
+    /// [`ColorVersion::Version3`] and [`ColorVersion::VersionBC`] ignore it.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ImageDenoise {
         Off = 0,
@@ -514,33 +585,38 @@ sdk_enum! {
 }
 
 sdk_enum! {
-    /// Which color version to use with the image processing settings.
-    /// Default is ColorVersion3, which is the new IPP2 color science.
+    /// Color science generation used by
+    /// [`ImageProcessingSettings`](crate::ImageProcessingSettings). New
+    /// settings default to [`Version3`](Self::Version3), the current IPP2
+    /// pipeline.
     #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub enum ColorVersion {
-        /// Legacy
+        /// Original legacy color science.
         Version1 = 1,
-        /// Legacy (FLUT)
+        /// Newer legacy color science that adds FLUT.
         Version2 = 2,
-        /// IPP2
+        /// IPP2.
         Version3 = 3,
+        /// Broadcast pipeline. Only Broadcast-mode recordings can use it.
         VersionBC = 4,
     }
 }
 
-/// Legacy (FLUT) only. Lift, Gamma and Gain settings.
+/// Per-channel lift, gamma and gain. Only the legacy
+/// [`ColorVersion::Version2`] pipeline uses it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LiftGammaGain {
-    /// -1 -- 1
+    /// Range -1 to 1.
     pub lift: f32,
-    /// 0 -- 4
+    /// Range 0 to 4.
     pub gamma: f32,
-    /// 0 -- 2
+    /// Range 0 to 2.
     pub gain: f32,
 }
 
-/// IPP2 only, Color Decision List settings.
+/// Slope, offset and power for one channel of a CDL (Color Decision List).
+/// Used by IPP2 only.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SlopeOffsetPower {
@@ -552,11 +628,13 @@ pub struct SlopeOffsetPower {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IMUSample {
-    /// in microseconds, see RMD_FRAME_TIMESTAMP + [`Clip::metadata_for_frame`](crate::Clip::metadata_for_frame)
+    /// Time in microseconds. Comparable with the per-frame
+    /// `RMD_FRAME_TIMESTAMP` metadata returned by
+    /// [`Clip::metadata_for_frame`](crate::Clip::metadata_for_frame).
     pub timestamp: u64,
-    /// in G's
+    /// Acceleration in g.
     pub acceleration: Axes,
-    /// in deg/s
+    /// Angular rate in degrees per second.
     pub rotation: Axes,
 }
 #[repr(C)]

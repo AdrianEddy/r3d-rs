@@ -99,7 +99,8 @@ pub struct RedMetal {
 }
 
 impl RedMetal {
-    /// Create REDMetal wrapper
+    /// Create the Metal debayer. The SDK allocates the Metal buffers and
+    /// textures it needs itself.
     pub fn new(sdk: &Sdk) -> RedResult<Self> {
         sdk.require(InitializeFlags::Metal)?;
         let ptr = cpp!(unsafe [] -> *mut c_void as "R3DSDK::REDMetal *" {
@@ -129,8 +130,8 @@ impl RedMetal {
         DebayerMetalJob { ptr, owner: self.inner.clone(), settings: None }
     }
 
-    /// checks to see if a context and command queue are compatible with REDMetal
-    /// This call may take several seconds on slower cards
+    /// Check that `queue` and its device can be used with this debayer. On a
+    /// slow GPU this can take a few seconds.
     ///
     /// # Safety
     /// `queue` must be a valid `id<MTLCommandQueue>`.
@@ -144,10 +145,14 @@ impl RedMetal {
         if error == 0 { Ok(()) } else { Err(RedError::MetalError(error)) }
     }
 
-    /// processes a frame.
-    /// Thread safe blocking call
-    /// This function will enqueue the Metal commands and wait for the processing to complete
-    /// to ensure memory buffers are not released prior to completion of kernel
+    /// Debayer a frame and wait until the GPU is done with it.
+    ///
+    /// The Metal commands go on `queue`, and the call blocks until they have
+    /// run, so the job's buffers can be freed as soon as it returns. It may
+    /// be called from several threads at once.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedMetal`].
     ///
     /// # Safety
     /// `queue` must be a valid `id<MTLCommandQueue>`.
@@ -165,11 +170,18 @@ impl RedMetal {
         if error == 0 { Ok(()) } else { Err(RedError::MetalError(error)) }
     }
 
-    /// enqueues all red processing on the current command queue. NOTE: All calls to this
-    /// should be done using a single MTLCommandQueue to avoid potential MTLCommandBuffer failures
-    /// once this has been called you will need to call [`DebayerMetalJob::complete_async`]
-    /// This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
-    /// If the commands have already completed there is no wait involved
+    /// Put all the work to debayer a frame on `queue` and return without
+    /// waiting for it.
+    ///
+    /// Use one `MTLCommandQueue` for every `process_async` call: spreading
+    /// them over several queues can make Metal command buffers fail.
+    ///
+    /// Finish the frame with [`DebayerMetalJob::complete_async`], which waits
+    /// for the queued work, if it is still running, and frees the frame's
+    /// remaining resources. Dropping the job does the same.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedMetal`].
     ///
     /// # Safety
     /// `queue` must be a valid `id<MTLCommandQueue>`.
@@ -188,9 +200,10 @@ impl RedMetal {
         if error == 0 { Ok(()) } else { Err(RedError::MetalError(error)) }
     }
 
-    /// flushes the current batch job that has been queued for the current MTLCommandQueue
-    /// after this has been called the jobs in the current batch will be processed in the order they were submitted
-    /// [`DebayerMetalJob::complete_async`] will return after each job in the batch completes
+    /// Run the batch of jobs collected so far on `queue` (see
+    /// [`DebayerMetalJob::set_batch_mode`]), oldest job first.
+    /// [`DebayerMetalJob::complete_async`] on any of them returns as soon as
+    /// that job is done.
     ///
     /// # Safety
     /// `queue` must be a valid `id<MTLCommandQueue>`.
@@ -221,6 +234,8 @@ unsafe impl Send for DebayerMetalJob {}
 impl DebayerMetalJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
 
+    /// How many bytes the image this job produces takes up with its current
+    /// settings, which is also the smallest output buffer it accepts.
     pub fn result_frame_size(&self) -> usize {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "const R3DSDK::DebayerMetalJob *"] -> usize as "size_t" {
@@ -228,8 +243,6 @@ impl DebayerMetalJob {
         })
     }
 
-    /// NOTE: This pointer + MTLBuffer & their contents must remain valid until [`complete_async`](DebayerMetalJob::complete_async) or [`RedMetal::process_blocking`] returns!
-    ///
     /// The frame to debayer: the output buffer of a completed decompress
     /// (an [`AsyncDecompressJob`](crate::AsyncDecompressJob) of
     /// [`AsyncDecoder`](crate::AsyncDecoder) or [`GpuDecoder`](crate::GpuDecoder)).
@@ -255,11 +268,12 @@ impl DebayerMetalJob {
         cpp!(unsafe [ptr as "R3DSDK::DebayerMetalJob *", p as "id<MTLBuffer>"] { ptr->raw_device_mem = p; });
     }
 
-    /// result/output buffer on the GPU
-    /// object of the size output_device_mem_size
-    /// -- do not use output_device_image when using this field
+    /// The Metal buffer to write the debayered image to, of `size` bytes,
+    /// which must be nonzero and at least
+    /// [`result_frame_size`](Self::result_frame_size).
     ///
-    /// The Metal buffer to write the debayered image to, of `size` bytes.
+    /// Set either this or
+    /// [`set_output_device_image`](Self::set_output_device_image), not both.
     ///
     /// # Safety
     /// `p` must be such a buffer on the processing device, valid for writes of
@@ -274,13 +288,13 @@ impl DebayerMetalJob {
         });
     }
 
-    /// alternate result/output texture on the GPU (16-bit uint and float supported)
-    /// use this field if you want the result image written to an MTLTexture
-    /// -- do not use output_device_mem when using this field
-    ///
     /// The `id<MTLTexture>` to write the debayered image to instead of a
-    /// buffer (16-bit uint and float formats are supported), with `size` the
-    /// byte size of its storage.
+    /// buffer, with `size` the byte size of its storage. The texture may use
+    /// a 16-bit unsigned integer or a floating-point pixel format. This
+    /// option is specific to Metal.
+    ///
+    /// Set either this or
+    /// [`set_output_device_mem`](Self::set_output_device_mem), not both.
     ///
     /// # Safety
     /// `p` must be such a texture on the processing device, valid until processing of the job is complete: until
@@ -322,8 +336,8 @@ impl DebayerMetalJob {
         });
     }
 
-    /// Image processing settings to apply. These must be set. The job keeps
-    /// its own copy.
+    /// The color, exposure and other image processing settings for this
+    /// job. They must be set before processing; the job stores a copy.
     pub fn set_image_processing(&mut self, v: &ImageProcessingSettings) {
         let ptr = self.ptr;
         let v: *const ImageProcessingSettings = &**self.settings.insert(Box::new(*v));
@@ -332,10 +346,10 @@ impl DebayerMetalJob {
         });
     }
 
-    /// Supported pixel types are:
-    /// * [`VideoPixelType::Rgb16bitInterleaved`]
-    /// * [`VideoPixelType::RgbHalfFloatInterleaved`]
-    /// * [`VideoPixelType::RgbHalfFloatAcesInt`]
+    /// The pixel format of the output image. The Metal debayer can produce
+    /// [`VideoPixelType::Rgb16bitInterleaved`],
+    /// [`VideoPixelType::RgbHalfFloatInterleaved`] and
+    /// [`VideoPixelType::RgbHalfFloatAcesInt`].
     pub fn set_pixel_type(&mut self, pixel_type: VideoPixelType) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerMetalJob *", pixel_type as "int"] {
@@ -343,10 +357,10 @@ impl DebayerMetalJob {
         });
     }
 
-    /// This will ensure all objects used for the frame are disposed of.
-    /// This call will block until the debayer on the queue executes, if the debayer has already executed no blocking will occur
-    /// This function must be called at a point after passing the job into [`RedMetal::process_async`]
-    /// This will automatically be called when the job is dropped if it is not manually called earlier
+    /// Wait for the commands queued by [`RedMetal::process_async`] to
+    /// finish, then free the frame resources the SDK still holds for this
+    /// job. Returns immediately if the work is already done. Dropping the job
+    /// calls this for you.
     pub fn complete_async(&mut self) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerMetalJob *"] {
@@ -354,11 +368,16 @@ impl DebayerMetalJob {
         });
     }
 
-    /// Enables batch processing of frames - frames added to a single batch will all complete together when flush() is called
-    /// `true` to add frame to the batch, queuing up the work
-    /// `false` to add frame to the batch, and then complete the whole batch
-    /// Leaving the field `false` will cause frames to be processed individually
-    /// Recommended batch size: 2 for laptops, 4 for iMac Pro, 8 for Mac Pro (2019)
+    /// Group this frame with others on the same command queue, so that the
+    /// whole group completes at once. Batching is specific to Metal.
+    ///
+    /// With `true`, the frame joins the queue's current batch and its work
+    /// is held back. With `false`, the frame joins the batch and the batch
+    /// is then run. A job that keeps the default of `false` is therefore
+    /// processed on its own. [`RedMetal::flush`] runs a pending batch.
+    ///
+    /// Good batch sizes are 2 on a laptop, 4 on an iMac Pro and 8 on a
+    /// 2019 Mac Pro.
     pub fn set_batch_mode(&mut self, v: bool) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerMetalJob *", v as "bool"] {
@@ -386,23 +405,27 @@ sdk_enum! {
         Ok = 0,
         ErrorProcessing = 1,
         InvalidJobParameter = 2,
-        /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+        /// The job's mode is unknown to this SDK, or does not fit the mode
+        /// the frame was decompressed with.
         InvalidJobParameter_mode = 3,
-        /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+        /// The raw host memory is null, is not in host memory, does not hold
+        /// a frame from `decode_for_gpu_sdk`, or comes from an R3D SDK whose
+        /// version does not match the GPU library.
         InvalidJobParameter_raw_host_mem = 4,
-        /// Raw device mem was NULL
+        /// The raw device memory is null.
         InvalidJobParameter_raw_device_mem = 5,
-        /// unsupported pixel type
+        /// The job's pixel type is not one this debayer can produce.
         InvalidJobParameter_pixelType = 6,
-        /// Output buffer Size must be non zero.
-        /// Output buffer must be allocated prior to passing it into the sdk
+        /// The output size is zero, or the output buffer was not allocated
+        /// before the job was processed.
         InvalidJobParameter_output_device_mem_size = 7,
         InvalidJobParameter_output_device_mem = 8,
-        /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+        /// The image processing settings ask for
+        /// [`ColorVersion::Version1`], which GPU processing does not support.
         InvalidJobParameter_ColorVersion1 = 9,
-        /// GPU Device did not meet minimum requirements.
+        /// The GPU falls short of the SDK's minimum requirements.
         UnableToUseGPUDevice = 10,
-        /// Error loading R3DSDK dynamic library
+        /// One of the SDK's dynamic libraries failed to load.
         UnableToLoadLibrary = 11,
         ParameterUnsupported = 12,
         InvalidAPIObject = 13,

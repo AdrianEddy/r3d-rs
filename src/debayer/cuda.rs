@@ -45,7 +45,9 @@ pub struct RedCuda {
 }
 
 impl RedCuda {
-    /// Create REDCuda wrapper and bind cudart functions dynamically
+    /// Create the CUDA debayer, binding it to the CUDA runtime functions
+    /// loaded from `cudart` at run time. Fails with
+    /// [`RedError::RedCudaLibraryNotFound`] if that library cannot be loaded.
     pub fn new(sdk: &Sdk) -> RedResult<Self> {
         sdk.require(InitializeFlags::Cuda)?;
         let funcs = CUDA.as_ref().map_err(|_| RedError::RedCudaLibraryNotFound)?;
@@ -114,8 +116,8 @@ impl RedCuda {
         DebayerCudaJob { ptr, owner: self.inner.clone(), settings: None }
     }
 
-    /// checks to see if a device and stream queue are compatible with REDCuda.
-    /// This call may take several seconds on slower cards
+    /// Check that device `device_id` and `stream` can be used with this
+    /// debayer. On a slow GPU this can take a few seconds.
     ///
     /// # Safety
     /// `stream` must be a CUDA stream of device `device_id` (or null for its
@@ -131,12 +133,15 @@ impl RedCuda {
         if cuda_error == 0 { Ok(()) } else { Err(RedError::CudaError(cuda_error)) }
     }
 
-    /// processes a frame.
-    /// Thread safe blocking call
-    /// This function will enqueue the cuda kernels and wait for the processing to complete
+    /// Debayer a frame and wait until the GPU is done with it.
     ///
-    /// To ensure memory buffers are not released prior to completion of kernel deviceId and stream are used as tokens for internal object mapping.
-    /// Be sure you have already done setCudaDevice on the thread using the passed in deviceId prior to calling process
+    /// The CUDA kernels go on `stream`, and the call blocks until they have
+    /// run, so the job's buffers can be freed as soon as it returns. It may
+    /// be called from several threads at once. The SDK looks up its internal
+    /// objects by the `device_id` and `stream` pair.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedCuda`].
     ///
     /// # Safety
     /// `stream` must be a CUDA stream of device `device_id` (or null for its
@@ -155,11 +160,15 @@ impl RedCuda {
         }))?;
         if cuda_error == 0 { Ok(()) } else { Err(RedError::CudaError(cuda_error)) }
     }
-    /// enqueues all red processing on the current stream
-    /// once this has been called you will need to call [`DebayerCudaJob::complete_async`]
+    /// Put all the work to debayer a frame on `stream` and return without
+    /// waiting for it.
     ///
-    /// This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
-    /// If the commands have already completed there is no wait involved
+    /// Finish the frame with [`DebayerCudaJob::complete_async`], which waits
+    /// for the queued work, if it is still running, and frees the frame's
+    /// remaining resources. Dropping the job does the same.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedCuda`].
     ///
     /// # Safety
     /// `stream` must be a CUDA stream of device `device_id` (or null for its
@@ -197,6 +206,8 @@ unsafe impl Send for DebayerCudaJob {}
 impl DebayerCudaJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
 
+    /// How many bytes the image this job produces takes up with its current
+    /// settings, which is also the smallest output buffer it accepts.
     pub fn result_frame_size(&self) -> usize {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "const R3DSDK::DebayerCudaJob *"] -> usize as "size_t" {
@@ -232,7 +243,9 @@ impl DebayerCudaJob {
             ptr->raw_device_mem = p;
         });
     }
-    /// The CUDA buffer to write the debayered image to, of `size` bytes.
+    /// The CUDA buffer to write the debayered image to, of `size` bytes,
+    /// which must be nonzero and at least
+    /// [`result_frame_size`](Self::result_frame_size).
     ///
     /// # Safety
     /// `p` must be such a buffer on the processing device, valid for writes of
@@ -270,8 +283,8 @@ impl DebayerCudaJob {
         });
     }
 
-    /// Image processing settings to apply. These must be set. The job keeps
-    /// its own copy.
+    /// The color, exposure and other image processing settings for this
+    /// job. They must be set before processing; the job stores a copy.
     pub fn set_image_processing(&mut self, v: &ImageProcessingSettings) {
         let ptr = self.ptr;
         let v: *const ImageProcessingSettings = &**self.settings.insert(Box::new(*v));
@@ -280,6 +293,10 @@ impl DebayerCudaJob {
         });
     }
 
+    /// The pixel format of the output image. The CUDA debayer can produce
+    /// [`VideoPixelType::Rgb16bitInterleaved`],
+    /// [`VideoPixelType::RgbHalfFloatInterleaved`] and
+    /// [`VideoPixelType::RgbHalfFloatAcesInt`].
     pub fn set_pixel_type(&mut self, pixel_type: VideoPixelType) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *", pixel_type as "int"] {
@@ -287,7 +304,10 @@ impl DebayerCudaJob {
         });
     }
 
-    /// Wait for async kernels completion and clean up frame resources
+    /// Wait for the kernels queued by [`RedCuda::process_async`] to finish,
+    /// then free the frame resources the SDK still holds for this job.
+    /// Returns immediately if the work is already done. Dropping the job
+    /// calls this for you.
     pub fn complete_async(&mut self) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerCudaJob *"] {
@@ -315,26 +335,31 @@ sdk_enum! {
         Ok = 0,
         ErrorProcessing = 1,
         InvalidJobParameter = 2,
-        /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+        /// The job's mode is unknown to this SDK, or does not fit the mode
+        /// the frame was decompressed with.
         InvalidJobParameter_mode = 3,
-        /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+        /// The raw host memory is null, is not in host memory, does not hold
+        /// a frame from `decode_for_gpu_sdk`, or comes from an R3D SDK whose
+        /// version does not match the GPU library.
         InvalidJobParameter_raw_host_mem = 4,
-        /// Raw device mem was NULL
+        /// The raw device memory is null.
         InvalidJobParameter_raw_device_mem = 5,
-        /// unsupported pixel type
+        /// The job's pixel type is not one this debayer can produce.
         InvalidJobParameter_pixelType = 6,
-        /// Output buffer Size must be non zero.
-        /// Output buffer must be allocated prior to passing it into the sdk
+        /// The output size is zero, or the output buffer was not allocated
+        /// before the job was processed.
         InvalidJobParameter_output_device_mem_size = 7,
         InvalidJobParameter_output_device_mem = 8,
-        /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+        /// The image processing settings ask for
+        /// [`ColorVersion::Version1`], which GPU processing does not support.
         InvalidJobParameter_ColorVersion1 = 9,
-        /// GPU Device did not meet minimum requirements.
+        /// The GPU falls short of the SDK's minimum requirements.
         UnableToUseGPUDevice = 10,
-        /// Error loading R3DSDK dynamic library
+        /// One of the SDK's dynamic libraries failed to load.
         UnableToLoadLibrary = 11,
         ParameterUnsupported = 12,
-        /// deviceId must be an index between 0 and the number of devices on the system minus one
+        /// `device_id` is out of range: it has to be at least 0 and below the
+        /// number of CUDA devices present.
         InvalidJobParameter_deviceId = 13,
     }
 }

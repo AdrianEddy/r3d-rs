@@ -6,9 +6,10 @@ use crate::ffi::enum_from_sdk;
 use core::ffi::c_char;
 use cpp::*;
 
-/// This structure gives access to the default, minimum and maximum setting
-/// for each of the image processing parameters. Use this data in your User
-/// Interface so new options in future versions are automatically added.
+/// The default value and allowed range of each image processing setting,
+/// and the available choices for the enumerated ones. A user interface built
+/// from these instead of hard-coded ranges keeps up with whatever later SDK
+/// releases add.
 pub struct ImageProcessingLimits;
 
 impl ImageProcessingLimits {
@@ -105,7 +106,7 @@ impl ImageProcessingLimits {
     #[inline] pub fn cdl_power_max() -> f32 { cpp!(unsafe [] -> f32 as "float" { return R3DSDK::ImageProcessingLimits::CdlPowerMax; }) }
     #[inline] pub fn cdl_power_default() -> f32 { cpp!(unsafe [] -> f32 as "float" { return R3DSDK::ImageProcessingLimits::CdlPowerDefault; }) }
 
-    /// Get the list of valid ISO values
+    /// The ISO values the SDK accepts.
     pub fn iso_list() -> Vec<usize> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::ISOCount; });
         let mut result = Vec::with_capacity(count);
@@ -118,7 +119,9 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the list of gamma curve options
+    /// The gamma curve presets, in the same order as
+    /// [`gamma_curve_labels`](Self::gamma_curve_labels).
+    /// [`ImageGammaCurve::CustomPDlog`] is left out, as it is not a preset.
     pub fn gamma_curve_map() -> Vec<ImageGammaCurve> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::GammaCurveCount; });
         let mut result = Vec::with_capacity(count);
@@ -131,7 +134,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the labels for gamma curve options
+    /// Display names for [`gamma_curve_map`](Self::gamma_curve_map), index
+    /// for index.
     pub fn gamma_curve_labels() -> Vec<String> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::GammaCurveCount; });
         let mut result = Vec::with_capacity(count);
@@ -145,7 +149,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the list of color space options
+    /// The color space choices, in the same order as
+    /// [`color_space_labels`](Self::color_space_labels).
     pub fn color_space_map() -> Vec<ImageColorSpace> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::ColorSpaceCount; });
         let mut result = Vec::with_capacity(count);
@@ -158,7 +163,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the labels for color space options
+    /// Display names for [`color_space_map`](Self::color_space_map), index
+    /// for index.
     pub fn color_space_labels() -> Vec<String> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::ColorSpaceCount; });
         let mut result = Vec::with_capacity(count);
@@ -172,7 +178,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the list of image pipeline mode options
+    /// The image pipeline mode choices, in the same order as
+    /// [`image_pipeline_mode_labels`](Self::image_pipeline_mode_labels).
     pub fn image_pipeline_mode_map() -> Vec<ImagePipeline> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::ImagePipelineModeCount; });
         let mut result = Vec::with_capacity(count);
@@ -185,7 +192,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the labels for image pipeline mode options
+    /// Display names for [`image_pipeline_mode_map`](Self::image_pipeline_mode_map),
+    /// index for index.
     pub fn image_pipeline_mode_labels() -> Vec<String> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::ImagePipelineModeCount; });
         let mut result = Vec::with_capacity(count);
@@ -199,7 +207,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the list of highlight roll-off options
+    /// The highlight roll-off choices, in the same order as
+    /// [`highlight_roll_off_labels`](Self::highlight_roll_off_labels).
     pub fn highlight_roll_off_map() -> Vec<RollOff> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::HighlightRollOffCount; });
         let mut result = Vec::with_capacity(count);
@@ -212,7 +221,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the labels for highlight roll-off options
+    /// Display names for [`highlight_roll_off_map`](Self::highlight_roll_off_map),
+    /// index for index.
     pub fn highlight_roll_off_labels() -> Vec<String> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::HighlightRollOffCount; });
         let mut result = Vec::with_capacity(count);
@@ -226,7 +236,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the list of output tone map options
+    /// The output tone map choices, in the same order as
+    /// [`output_tone_map_labels`](Self::output_tone_map_labels).
     pub fn output_tone_map_map() -> Vec<ToneMap> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::OutputToneMapCount; });
         let mut result = Vec::with_capacity(count);
@@ -239,7 +250,8 @@ impl ImageProcessingLimits {
         result
     }
 
-    /// Get the labels for output tone map options
+    /// Display names for [`output_tone_map_map`](Self::output_tone_map_map),
+    /// index for index.
     pub fn output_tone_map_labels() -> Vec<String> {
         let count = cpp!(unsafe [] -> usize as "size_t" { return R3DSDK::ImageProcessingLimits::OutputToneMapCount; });
         let mut result = Vec::with_capacity(count);

@@ -61,26 +61,35 @@ pub enum RedError {
     // R3D status
     ErrorProcessing,
     InvalidJobParameter,
-    /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+    /// The job's decode mode is one this SDK does not support or, for a GPU
+    /// debayer job, it does not fit the mode the frame was decompressed with.
     InvalidJobParameterMode,
-    /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+    /// A GPU debayer job's raw host buffer was rejected. It has to be a
+    /// non-null pointer to host memory holding a frame decompressed by
+    /// [`AsyncDecoder::decode_for_gpu_sdk`](crate::AsyncDecoder::decode_for_gpu_sdk)
+    /// or [`GpuDecoder::decode_for_gpu_sdk`](crate::GpuDecoder::decode_for_gpu_sdk),
+    /// and the decompressing and debayering libraries must be of compatible
+    /// versions.
     InvalidJobParameterRawHostMem,
     InvalidJobParameterRawDeviceMem,
-    /// unsupported pixel type
+    /// The job's pixel type is not supported.
     InvalidJobParameterPixelType,
-    /// Output buffer Size must be non zero.
-    /// Output buffer must be allocated prior to passing it into the sdk
+    /// The job's output buffer size is zero. Allocate the output buffer, and
+    /// pass its size, before submitting the job.
     InvalidJobParameterOutputDeviceMemSize,
     InvalidJobParameterOutputDeviceMem,
-    /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+    /// The image processing settings ask for [`ColorVersion::Version1`],
+    /// which this SDK cannot process.
     InvalidJobParameterColorVersion1,
-    /// null, or unopened clip.
+    /// The job has no clip, or its clip is not open.
     InvalidJobParameterClip,
-    /// GPU Device did not meet minimum requirements.
+    /// The selected GPU falls short of the SDK's minimum requirements.
     UnableToUseGPUDevice,
-    /// No GPU Devices were setup on the R3DDecoderOptions class
+    /// The [`R3dDecoderOptions`](crate::R3dDecoderOptions) select no GPU; pick
+    /// one with [`use_cuda_device`](crate::R3dDecoderOptions::use_cuda_device)
+    /// or [`use_opencl_device`](crate::R3dDecoderOptions::use_opencl_device).
     NoGPUDeviceSpecified,
-    /// Error loading R3DSDK dynamic library
+    /// The SDK failed to load one of its dynamic libraries.
     UnableToLoadLibrary,
 
     InvalidJobParameterDeviceId,

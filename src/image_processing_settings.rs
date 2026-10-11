@@ -6,8 +6,18 @@ use crate::ffi::enum_from_sdk;
 use cpp::*;
 
 cpp_class! {
-    /// Settings to process the image with. If these settings are not
-    /// supplied the decoder will use the clip's default settings.
+    /// How a decode processes the image: white balance, exposure, color,
+    /// gamma and more. A decode given no settings uses the clip's own.
+    ///
+    /// [`Default`] gives the SDK's generic defaults, not the clip's; start
+    /// from [`Clip::default_image_processing_settings`](crate::Clip::default_image_processing_settings)
+    /// to match the clip. Values outside the ranges in
+    /// [`ImageProcessingLimits`](crate::ImageProcessingLimits) are clamped.
+    ///
+    /// Which settings apply depends on [`version`](Self::version). In the
+    /// method docs, IPP2 means [`ColorVersion::Version3`], Broadcast Color
+    /// [`ColorVersion::VersionBC`], and the legacy pipeline
+    /// [`ColorVersion::Version1`] or [`ColorVersion::Version2`].
     #[derive(Clone)]
     pub unsafe struct ImageProcessingSettings as "R3DSDK::ImageProcessingSettings"
 }
@@ -24,60 +34,62 @@ impl ImageProcessingSettings {
     // Core / global
     // --------------------------------------------------------------------------------
 
-    /// Brightness — Converted in ColorVersion3 mode. Ignored with ColorVersionBC.
+    /// Brightness. IPP2 applies it in converted form; Broadcast Color ignores it.
     pub fn     brightness(&self)     -> f32  { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Brightness; }) }
     pub fn set_brightness(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Brightness = v; }) }
 
-    /// ISO — will clamp to the nearest valid setting. See [`ImageProcessingLimits::iso_list`](crate::ImageProcessingLimits::iso_list).
+    /// ISO. A value missing from [`ImageProcessingLimits::iso_list`](crate::ImageProcessingLimits::iso_list) snaps to the closest listed one.
     pub fn     iso(&self)      -> usize { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> usize as "size_t" { return (*self).ISO; }) }
     pub fn set_iso(&mut self, v: usize) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "size_t"] { (*self).ISO = v; }) }
 
-    /// Color version — defaults to latest (V3). Settings out of bounds will be clipped.
-    /// If a lower version is set for a newer clip it will be forced up.
+    /// Color science version, the newest (IPP2) by default. A version older
+    /// than the clip supports is raised to one the clip can use.
     pub fn     version(&self)     -> ColorVersion { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).Version; })) }
     pub fn set_version(&mut self, v: ColorVersion) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).Version = (R3DSDK::ColorVersion)v; }) }
 
-    /// Kelvin color temperature for white balance.
+    /// White balance color temperature, in kelvin.
     pub fn     kelvin(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Kelvin; }) }
     pub fn set_kelvin(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Kelvin = v; }) }
 
-    /// Tint for white balance.
+    /// White balance tint.
     pub fn     tint(&self)       -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Tint; }) }
     pub fn set_tint(&mut self, v: f32)   { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Tint = v; }) }
 
-    /// Exposure Compensation — converted in ColorVersion3 mode.
+    /// Exposure compensation. IPP2 applies it in converted form.
     pub fn     exposure_compensation(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).ExposureCompensation; }) }
     pub fn set_exposure_compensation(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).ExposureCompensation = v; }) }
 
-    /// Gain Red — ignored with ColorVersion3 or ColorVersionBC.
+    /// Red gain. Legacy pipeline only.
     pub fn     gain_red(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).GainRed; }) }
     pub fn set_gain_red(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).GainRed = v; }) }
 
-    /// Gain Green — ignored with ColorVersion3 or ColorVersionBC.
+    /// Green gain. Legacy pipeline only.
     pub fn     gain_green(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).GainGreen; }) }
     pub fn set_gain_green(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).GainGreen = v; }) }
 
-    /// Gain Blue — ignored with ColorVersion3 or ColorVersionBC.
+    /// Blue gain. Legacy pipeline only.
     pub fn     gain_blue(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).GainBlue; }) }
     pub fn set_gain_blue(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).GainBlue = v; }) }
 
-    /// Saturation — ignored with ColorVersion3 or ColorVersionBC.
+    /// Saturation. Legacy pipeline only.
     pub fn     saturation(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Saturation; }) }
     pub fn set_saturation(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Saturation = v; }) }
 
-    /// Contrast — ignored with ColorVersion3 or ColorVersionBC.
+    /// Contrast. Legacy pipeline only.
     pub fn     contrast(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Contrast; }) }
     pub fn set_contrast(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Contrast = v; }) }
 
-    /// DRX — highlight extension; ignored for Dragon/Helium or in ColorVersion3/BC.
+    /// DRX highlight extension. Legacy pipeline only, and without effect on Dragon or Helium clips.
     pub fn     drx(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).DRX; }) }
     pub fn set_drx(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).DRX = v; }) }
 
-    /// Image Gamma Curve (limited in Broadcast Color), an [`ImageGammaCurve`] value.
+    /// Output gamma curve, an [`ImageGammaCurve`] value. Broadcast Color only accepts
+    /// [`ImageGammaCurve::BT1886`] and [`ImageGammaCurve::HDR2084`].
     pub fn     gamma_curve(&self)     -> i32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).GammaCurve; }) }
     pub fn set_gamma_curve(&mut self, v: i32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).GammaCurve = (R3DSDK::ImageGammaCurve)v; }) }
 
-    /// Image Color Space (limited in Broadcast Color), an [`ImageColorSpace`] value.
+    /// Output color space, an [`ImageColorSpace`] value. Broadcast Color only accepts
+    /// [`ImageColorSpace::Rec709`] and [`ImageColorSpace::Rec2020`].
     pub fn     color_space(&self)     -> i32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).ColorSpace; }) }
     pub fn set_color_space(&mut self, v: i32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).ColorSpace = (R3DSDK::ImageColorSpace)v; }) }
 
@@ -85,15 +97,15 @@ impl ImageProcessingSettings {
     // Custom PDLog (ignored in IPP2/BC)
     // --------------------------------------------------------------------------------
 
-    /// Custom PDLog Black Point — set when the gamma curve is [`ImageGammaCurve::CustomPDlog`].
+    /// Black point of the custom PDlog curve. Fill in all three PDlog values when choosing [`ImageGammaCurve::CustomPDlog`].
     pub fn     custom_pdlog_black_point(&self)     -> usize { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> usize as "size_t" { return (*self).CustomPDLogBlackPoint; }) }
     pub fn set_custom_pdlog_black_point(&mut self, v: usize) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "size_t"] { (*self).CustomPDLogBlackPoint = v; }) }
 
-    /// Custom PDLog White Point — set when the gamma curve is [`ImageGammaCurve::CustomPDlog`].
+    /// White point of the custom PDlog curve, see [`custom_pdlog_black_point`](Self::custom_pdlog_black_point).
     pub fn     custom_pdlog_white_point(&self)     -> usize { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> usize as "size_t" { return (*self).CustomPDLogWhitePoint; }) }
     pub fn set_custom_pdlog_white_point(&mut self, v: usize) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "size_t"] { (*self).CustomPDLogWhitePoint = v; }) }
 
-    /// Custom PDLog Gamma — set when the gamma curve is [`ImageGammaCurve::CustomPDlog`].
+    /// Gamma of the custom PDlog curve, see [`custom_pdlog_black_point`](Self::custom_pdlog_black_point).
     pub fn     custom_pdlog_gamma(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).CustomPDLogGamma; }) }
     pub fn set_custom_pdlog_gamma(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).CustomPDLogGamma = v; }) }
 
@@ -101,8 +113,10 @@ impl ImageProcessingSettings {
     // User curves
     // --------------------------------------------------------------------------------
 
-    /// Luma user curve — 5-point spline (black..white) as 10 floats in the 0–1 range.
-    /// X’s must satisfy: blackX < lowX < midX < highX < whiteX.
+    /// Luma curve through five control points from black to white, stored as
+    /// `[x0, y0, x1, y1, ..., x4, y4]` with every coordinate in 0..=1. The x
+    /// values must strictly increase; otherwise the SDK falls back to a
+    /// straight line. Ignored by Broadcast Color.
     pub fn     user_curve(&self) -> &[f32] {
         let ptr = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const f32 as "const float *" { return (*self).UserCurve; });
         unsafe { std::slice::from_raw_parts(ptr, 10) }
@@ -113,7 +127,7 @@ impl ImageProcessingSettings {
         unsafe { std::slice::from_raw_parts_mut(ptr, 10) }
     }
 
-    /// Red user curve — ignored in Broadcast Color.
+    /// Red channel curve, laid out like [`user_curve`](Self::user_curve). Legacy pipeline only.
     pub fn     user_curve_red(&self) -> &[f32] {
         let ptr = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const f32 as "const float *" { return (*self).UserCurveRed; });
         unsafe { std::slice::from_raw_parts(ptr, 10) }
@@ -124,7 +138,7 @@ impl ImageProcessingSettings {
         unsafe { std::slice::from_raw_parts_mut(ptr, 10) }
     }
 
-    /// Green user curve — ignored in Broadcast Color.
+    /// Green channel curve, laid out like [`user_curve`](Self::user_curve). Legacy pipeline only.
     pub fn     user_curve_green(&self) -> &[f32] {
         let ptr = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const f32 as "const float *" { return (*self).UserCurveGreen; });
         unsafe { std::slice::from_raw_parts(ptr, 10) }
@@ -135,7 +149,7 @@ impl ImageProcessingSettings {
         unsafe { std::slice::from_raw_parts_mut(ptr, 10) }
     }
 
-    /// Blue user curve — ignored in Broadcast Color.
+    /// Blue channel curve, laid out like [`user_curve`](Self::user_curve). Legacy pipeline only.
     pub fn     user_curve_blue(&self) -> &[f32] {
         let ptr = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const f32 as "const float *" { return (*self).UserCurveBlue; });
         unsafe { std::slice::from_raw_parts(ptr, 10) }
@@ -150,27 +164,30 @@ impl ImageProcessingSettings {
     // Premium decode-only (ignored in IPP2/BC where noted)
     // --------------------------------------------------------------------------------
 
-    /// Detail — only used for full res premium decode; ignored in IPP2/BC.
+    /// Detail level. Only used by full-resolution premium decodes with the legacy pipeline.
     pub fn     detail(&self)     -> ImageDetail { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).Detail; })) }
     pub fn set_detail(&mut self, v: ImageDetail) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).Detail = (R3DSDK::ImageDetail)v; }) }
 
-    /// OLPF Compensation — premium full/half res; ignored in IPP2/BC.
+    /// OLPF compensation. Only used by full- and half-resolution premium decodes with the legacy pipeline.
     pub fn     olpf_compensation(&self)     -> ImageOLPFCompensation { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).OLPFCompensation; })) }
     pub fn set_olpf_compensation(&mut self, v: ImageOLPFCompensation) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).OLPFCompensation = (R3DSDK::ImageOLPFCompensation)v; }) }
 
-    /// Denoise — only used for full res premium decode; ignored in IPP2/BC.
+    /// Noise reduction level. Only used by full-resolution premium decodes with the legacy pipeline.
     pub fn     denoise(&self)     -> ImageDenoise { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).Denoise; })) }
     pub fn set_denoise(&mut self, v: ImageDenoise) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).Denoise = (R3DSDK::ImageDenoise)v; }) }
 
-    /// Dragon Enhanced Blacks (legacy pipe, Dragon+ sensors) — union with ChromaNoiseReduction.
+    /// Dragon Enhanced Blacks, for Dragon and newer sensors in the legacy pipeline. Only used by
+    /// full- and half-resolution premium decodes. Stored in the same place as
+    /// [`chroma_noise_reduction`](Self::chroma_noise_reduction), so setting one changes the other.
     pub fn     deb(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).DEB; }) }
     pub fn set_deb(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).DEB = v; }) }
 
-    /// Chroma Noise Reduction (IPP2 & Broadcast) — union with DEB.
+    /// Chroma noise reduction, for IPP2 and Broadcast Color. Only used by full- and half-resolution
+    /// premium decodes. Shares its storage with [`deb`](Self::deb).
     pub fn     chroma_noise_reduction(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).ChromaNoiseReduction; }) }
     pub fn set_chroma_noise_reduction(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).ChromaNoiseReduction = v; }) }
 
-    /// Flashing Pixel Adjustment — premium full/half res; ignored for N-RAW.
+    /// Flashing pixel adjustment. Only used by full- and half-resolution premium decodes, and never for N-RAW clips.
     pub fn     flashing_pixel_adjustment(&self)     -> FlashingPixelAdjust { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).FlashingPixelAdjustment; })) }
     pub fn set_flashing_pixel_adjustment(&mut self, v: FlashingPixelAdjust) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).FlashingPixelAdjustment = (R3DSDK::FlashingPixelAdjust)v; }) }
 
@@ -178,27 +195,27 @@ impl ImageProcessingSettings {
     // ColorVersion2-only (not IPP2/BC)
     // --------------------------------------------------------------------------------
 
-    /// Shadow — ignored with ColorVersion3 & Broadcast Color.
+    /// Shadow. Legacy pipeline only.
     pub fn     shadow(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).Shadow; }) }
     pub fn set_shadow(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).Shadow = v; }) }
 
-    /// FLUT (fine ISO control) — ignored with ColorVersion3 & Broadcast Color.
+    /// FLUT, a fine-grained ISO adjustment. Legacy pipeline only.
     pub fn     flut(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).FLUT; }) }
     pub fn set_flut(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).FLUT = v; }) }
 
     // --------------------------------------------------------------------------------
-    // Lift/Gamma/Gain (ignored in IPP2/BC) — expose raw pointers for FFI helpers
+    // Lift/Gamma/Gain (ignored in IPP2/BC) — references into the C++ struct
     // --------------------------------------------------------------------------------
 
-    /// LggRed (post lift/gamma/gain). Returns const ptr to underlying C++ struct.
+    /// Lift, gamma and gain for the red channel. Legacy pipeline only.
     pub fn     lgg_red(&self) -> &LiftGammaGain { let p: *const LiftGammaGain = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const LiftGammaGain as "const R3DSDK::LiftGammaGain*" { return &(*self).LggRed; }); unsafe { &*p } }
     pub fn lgg_red_mut(&mut self) -> &mut LiftGammaGain { let p: *mut LiftGammaGain = cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *"] -> *mut LiftGammaGain as "R3DSDK::LiftGammaGain*" { return &(*self).LggRed; }); unsafe { &mut *p } }
 
-    /// LggGreen pointer access.
+    /// Lift, gamma and gain for the green channel, see [`lgg_red`](Self::lgg_red).
     pub fn     lgg_green(&self) -> &LiftGammaGain { let p: *const LiftGammaGain = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const LiftGammaGain as "const R3DSDK::LiftGammaGain*" { return &(*self).LggGreen; }); unsafe { &*p } }
     pub fn lgg_green_mut(&mut self) -> &mut LiftGammaGain { let p: *mut LiftGammaGain = cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *"] -> *mut LiftGammaGain as "R3DSDK::LiftGammaGain*" { return &(*self).LggGreen; }); unsafe { &mut *p } }
 
-    /// LggBlue pointer access.
+    /// Lift, gamma and gain for the blue channel, see [`lgg_red`](Self::lgg_red).
     pub fn     lgg_blue(&self) -> &LiftGammaGain { let p: *const LiftGammaGain = cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *const LiftGammaGain as "const R3DSDK::LiftGammaGain*" { return &(*self).LggBlue; }); unsafe { &*p } }
     pub fn lgg_blue_mut(&mut self) -> &mut LiftGammaGain { let p: *mut LiftGammaGain = cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *"] -> *mut LiftGammaGain as "R3DSDK::LiftGammaGain*" { return &(*self).LggBlue; }); unsafe { &mut *p } }
 
@@ -210,7 +227,7 @@ impl ImageProcessingSettings {
     pub fn     image_pipeline_mode(&self)     -> ImagePipeline { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).ImagePipelineMode; })) }
     pub fn set_image_pipeline_mode(&mut self, v: ImagePipeline) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).ImagePipelineMode = (R3DSDK::ImagePipeline)v; }) }
 
-    /// Exposure Adjust — also available with Broadcast Color.
+    /// IPP2 exposure adjustment, also honored by Broadcast Color.
     pub fn     exposure_adjust(&self)     -> f32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> f32 as "float" { return (*self).ExposureAdjust; }) }
     pub fn set_exposure_adjust(&mut self, v: f32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "float"] { (*self).ExposureAdjust = v; }) }
 
@@ -234,10 +251,11 @@ impl ImageProcessingSettings {
     pub fn     cdl_enabled(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).CdlEnabled; }) }
     pub fn set_cdl_enabled(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).CdlEnabled = v; }) }
 
-    /// 3D LUT handle — NULL if disabled/not set. Value unique per process.
+    /// Handle of the 3D LUT applied by IPP2, or null when there is none. A handle is only
+    /// meaningful inside the process that loaded the LUT and cannot be saved for later.
     pub fn     lut3d(&self)     -> *mut core::ffi::c_void { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> *mut core::ffi::c_void as "void *" { return (*self).Lut3D; }) }
 
-    /// 3D LUT enabled — defaults to false; only used if a LUT is set.
+    /// Whether to apply the 3D LUT. Off by default, and has no effect without a LUT.
     pub fn     lut3d_enabled(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).Lut3DEnabled; }) }
     pub fn set_lut3d_enabled(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).Lut3DEnabled = v; }) }
 
@@ -245,24 +263,26 @@ impl ImageProcessingSettings {
     pub fn     output_tone_map(&self)     -> ToneMap { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).OutputToneMap; })) }
     pub fn set_output_tone_map(&mut self, v: ToneMap) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).OutputToneMap = (R3DSDK::ToneMap)v; }) }
 
-    /// Highlight Roll-off — no effect with LOG curve applied.
+    /// Highlight roll-off. Does nothing while a log gamma curve is selected.
     pub fn     highlight_roll_off(&self)     -> RollOff { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).HighlightRollOff; })) }
     pub fn set_highlight_roll_off(&mut self, v: RollOff) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).HighlightRollOff = (R3DSDK::RollOff)v; }) }
 
-    /// HDR Peak Nits — HDR2084 only and HighlightRollOff != None.
+    /// Peak brightness of HDR output, in nits. Only used with [`ImageGammaCurve::HDR2084`] and a
+    /// highlight roll-off other than [`RollOff::None`].
     pub fn     hdr_peak_nits(&self)     -> u32 { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> u32 as "unsigned int" { return (*self).HdrPeakNits; }) }
     pub fn set_hdr_peak_nits(&mut self, v: u32) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "unsigned int"] { (*self).HdrPeakNits = v; }) }
 
-    /// Maskline Adjust — also available with Broadcast Color; ignored for N-RAW.
+    /// Maskline adjustment, also honored by Broadcast Color. Not used for N-RAW clips.
     pub fn     maskline_adjust(&self)     -> bool { cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> bool as "bool" { return (*self).MasklineAdjust; }) }
     pub fn set_maskline_adjust(&mut self, v: bool) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "bool"] { (*self).MasklineAdjust = v; }) }
 
-    /// Lens Distortion Correction (IPP2) — full & half res premium decodes only. Offer it only when the
-    /// clip's `RMD_LENS_DISTORTION_CORRECTION` metadata (`lens_distortion_correction`) is non-zero.
+    /// IPP2 lens distortion correction, applied by full- and half-resolution premium decodes. Only
+    /// worth offering when the clip's `lens_distortion_correction` metadata item
+    /// (`RMD_LENS_DISTORTION_CORRECTION`) is non-zero.
     pub fn     lens_distortion_correction(&self)     -> LensCorrection { enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::ImageProcessingSettings *"] -> i32 as "int" { return (int)(*self).LensDistortionCorrection; })) }
     pub fn set_lens_distortion_correction(&mut self, v: LensCorrection) { cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *", v as "int"] { (*self).LensDistortionCorrection = (R3DSDK::LensCorrection)v; }) }
 
-    /// Check to see if all parameters are within range and clip any that aren't.
+    /// Clamp every setting into its valid range.
     pub fn check_bounds(&mut self) {
         cpp!(unsafe [self as "R3DSDK::ImageProcessingSettings *"] {
             self->CheckBounds();
@@ -271,9 +291,8 @@ impl ImageProcessingSettings {
 }
 
 cpp_class! {
-    /// HDR blending settings. This structure needs to be constructed
-    /// to submit a HDR blending job to the decoder. Every field must
-    /// be set.
+    /// How to merge the two tracks of an HDRx clip into one image. Pass it
+    /// to a decode to get the blended frame rather than a single track.
     #[derive(Clone)]
     pub unsafe struct HdrProcessingSettings as "R3DSDK::HdrProcessingSettings"
 }
@@ -283,41 +302,41 @@ cpp_class! {
 unsafe impl Send for HdrProcessingSettings {}
 
 impl HdrProcessingSettings {
-    /// HDRx blending algorithm to use
+    /// Algorithm that merges the two HDRx tracks.
     pub fn hdr_blend_algorithm(&self) -> HdrBlendAlgorithm {
         enum_from_sdk(cpp!(unsafe [self as "const R3DSDK::HdrProcessingSettings *"] -> i32 as "int" {
             return (int)(*self).BlendAlgorithm;
         }))
     }
-    /// Set HDRx blending algorithm to use
+    /// Choose the algorithm that merges the two HDRx tracks.
     pub fn set_hdr_blend_algorithm(&mut self, v: HdrBlendAlgorithm) {
         let v: i32 = v as i32;
         cpp!(unsafe [self as "R3DSDK::HdrProcessingSettings *", v as "int"] {
             (*self).BlendAlgorithm = (R3DSDK::HdrBlendAlgorithm)v;
         })
     }
-    /// Amount of blending for the modes, must be in range of -1 -- +1
-    /// (will be clipped if it's not!)
+    /// Blend bias, between -1 and +1. What it controls depends on the
+    /// algorithm:
     ///
-    /// Bias is mode dependent. For Simple Blend it controls the blend
-    /// between the two images, +1 being full normal exposure, -1 being
-    /// full highlight track exposure and 0 being an equal blend of the two.
-    /// For Magic Motion, it adjusts the amount of highlight rolloff in the
-    /// blended HDR image. +1 is no highlight rolloff and -1 is full rolloff
+    /// - [`HdrBlendAlgorithm::HDRxSimpleBlend`]: the mix of the two tracks.
+    ///   +1 shows only the normal exposure, -1 only the highlight track, and
+    ///   0 weighs them equally.
+    /// - [`HdrBlendAlgorithm::HDRxMagicMotion`]: how strongly highlights roll
+    ///   off in the result, from not at all at +1 to fully at -1.
     pub fn bias(&self) -> f32 {
         cpp!(unsafe [self as "const R3DSDK::HdrProcessingSettings *"] -> f32 as "float" {
             return (*self).Bias;
         })
     }
-    /// Set amount of blending for the modes, must be in range of -1 -- +1
-    /// (will be clipped if it's not!)
+    /// Set the blend bias, see [`bias`](Self::bias). Values outside -1..=+1
+    /// get clamped.
     pub fn set_bias(&mut self, v: f32) {
         cpp!(unsafe [self as "R3DSDK::HdrProcessingSettings *", v as "float"] {
             (*self).Bias = v;
         })
     }
 
-    /// Check to see if all parameters are within the proper range and clip any that aren't
+    /// Clamp every setting into its valid range.
     pub fn check_bounds(&mut self) {
         cpp!(unsafe [self as "R3DSDK::HdrProcessingSettings *"] {
             self->CheckBounds();

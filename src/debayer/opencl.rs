@@ -39,10 +39,12 @@ pub struct RedOpenCl {
 }
 
 impl RedOpenCl {
-    /// `compiled_kernel_cache_folder` is a folder path to where you want the SDK to store and
-    /// load our compiled kernel files on disk. If you provide "" caching of compiled
-    /// kernels will be disabled which is NOT recommended as compile times can be long!
-    /// (see "OpenCL kernel caching.txt" for more information)
+    /// Create the OpenCL debayer.
+    ///
+    /// The SDK saves the OpenCL kernels it compiles for the GPU in
+    /// `compiled_kernel_cache_folder` and reuses them on later runs. Give it a
+    /// persistent local folder, not a temporary one. An empty string turns
+    /// the cache off, which is a bad idea: compiling the kernels is slow.
     pub fn new(sdk: &Sdk, compiled_kernel_cache_folder: &str) -> RedResult<Self> {
         sdk.require(InitializeFlags::OpenCL)?;
         let funcs = OPENCL.as_ref().map_err(|_| RedError::RedOpenCLLibraryNotFound)?;
@@ -211,10 +213,17 @@ impl RedOpenCl {
         DebayerOpenCLJob { ptr, owner: self.inner.clone(), settings: None }
     }
 
-    /// checks to see if a context and command queue are compatible with REDCL
-    /// This call may take several seconds on slower cards as kernels get compiled
-    /// Decode kernels are compiled asynchronously. All OpenCL processing will be blocked
-    /// until that is complete. See "OpenCL kernel caching.txt" for more information
+    /// Check that `context` and `queue` can be used with this debayer.
+    ///
+    /// This is where the SDK compiles its OpenCL kernels, which takes a few
+    /// seconds on a slow GPU, and possibly minutes when the kernel cache (see
+    /// [`new`](Self::new)) is cold. The decode kernels go on compiling in the
+    /// background after this returns, and until they are done any OpenCL
+    /// work in the process can stall, not only the SDK's. The debayer waits
+    /// for them when it is destroyed, so creating one, calling this and
+    /// dropping it fills the cache ahead of time, e.g. at install. With the
+    /// SDK initialized with [`InitializeFlags::DelayGpuCompile`], this call
+    /// compiles nothing and each kernel is compiled when first needed.
     ///
     /// # Safety
     /// `context` must be a valid `cl_context` and `queue` a valid
@@ -229,10 +238,14 @@ impl RedOpenCl {
         if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
     }
 
-    /// processes a frame.
-    /// Thread safe blocking call
-    /// This function will enqueue the OpenCL commands and wait for the processing to complete
-    /// to ensure memory buffers are not released prior to completion of kernel
+    /// Debayer a frame and wait until the GPU is done with it.
+    ///
+    /// The OpenCL commands go on `queue`, and the call blocks until they have
+    /// run, so the job's buffers can be freed as soon as it returns. It may
+    /// be called from several threads at once.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedOpenCl`].
     ///
     /// # Safety
     /// `context` must be a valid `cl_context` and `queue` a valid
@@ -250,11 +263,15 @@ impl RedOpenCl {
         }))?;
         if opencl_error == 0 { Ok(()) } else { Err(RedError::OpenCLError(opencl_error)) }
     }
-    /// enqueues all red processing on the current command queue
-    /// once this has been called you will need to call [`DebayerOpenCLJob::complete_async`]
+    /// Put all the work to debayer a frame on `queue` and return without
+    /// waiting for it.
     ///
-    /// This will wait for commands enqueued by this sdk for the current frame to complete and then releases any additional resources.
-    /// If the commands have already completed there is no wait involved
+    /// Finish the frame with [`DebayerOpenCLJob::complete_async`], which waits
+    /// for the queued work, if it is still running, and frees the frame's
+    /// remaining resources. Dropping the job does the same.
+    ///
+    /// Fails with [`RedError::InvalidJobParameter`] if `debayer_job` was
+    /// created by another [`RedOpenCl`].
     ///
     /// # Safety
     /// `context` must be a valid `cl_context` and `queue` a valid
@@ -291,6 +308,8 @@ unsafe impl Send for DebayerOpenCLJob {}
 impl DebayerOpenCLJob {
     pub fn as_mut_ptr(&self) -> *mut c_void { self.ptr }
 
+    /// How many bytes the image this job produces takes up with its current
+    /// settings, which is also the smallest output buffer it accepts.
     pub fn result_frame_size(&self) -> usize {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "const R3DSDK::DebayerOpenCLJob *"] -> usize as "size_t" {
@@ -326,7 +345,13 @@ impl DebayerOpenCLJob {
             ptr->raw_device_mem = (cl_mem)p;
         });
     }
-    /// The OpenCL buffer to write the debayered image to, of `size` bytes.
+    /// The OpenCL buffer to write the debayered image to, of `size` bytes,
+    /// which must be nonzero and at least
+    /// [`result_frame_size`](Self::result_frame_size).
+    ///
+    /// `p` may also be an OpenCL image instead of a buffer, for more control
+    /// over the output pixel format. The image then has to be large enough
+    /// for an output image in the job's pixel type.
     ///
     /// # Safety
     /// `p` must be such a buffer on the processing device, valid for writes of
@@ -364,8 +389,8 @@ impl DebayerOpenCLJob {
         });
     }
 
-    /// Image processing settings to apply. These must be set. The job keeps
-    /// its own copy.
+    /// The color, exposure and other image processing settings for this
+    /// job. They must be set before processing; the job stores a copy.
     pub fn set_image_processing(&mut self, v: &ImageProcessingSettings) {
         let ptr = self.ptr;
         let v: *const ImageProcessingSettings = &**self.settings.insert(Box::new(*v));
@@ -374,6 +399,10 @@ impl DebayerOpenCLJob {
         });
     }
 
+    /// The pixel format of the output image. The OpenCL debayer can produce
+    /// [`VideoPixelType::Rgb16bitInterleaved`],
+    /// [`VideoPixelType::RgbHalfFloatInterleaved`] and
+    /// [`VideoPixelType::RgbHalfFloatAcesInt`].
     pub fn set_pixel_type(&mut self, pixel_type: VideoPixelType) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *", pixel_type as "int"] {
@@ -381,7 +410,10 @@ impl DebayerOpenCLJob {
         });
     }
 
-    /// Wait for async kernels completion and clean up frame resources
+    /// Wait for the commands queued by [`RedOpenCl::process_async`] to
+    /// finish, then free the frame resources the SDK still holds for this
+    /// job. Returns immediately if the work is already done. Dropping the job
+    /// calls this for you.
     pub fn complete_async(&mut self) {
         let ptr = self.ptr;
         cpp!(unsafe [ptr as "R3DSDK::DebayerOpenCLJob *"] {
@@ -409,23 +441,27 @@ sdk_enum! {
         Ok = 0,
         ErrorProcessing = 1,
         InvalidJobParameter = 2,
-        /// mode value passed in is not compatible with this SDK or the mode used with the DecodeForGpuSdk call is not compatible
+        /// The job's mode is unknown to this SDK, or does not fit the mode
+        /// the frame was decompressed with.
         InvalidJobParameter_mode = 3,
-        /// pointer is NULL, data is not from DecodeForGpuSdk, R3DSDK and GPUSDK versions are incompatible or buffer is not actually in host memory.
+        /// The raw host memory is null, is not in host memory, does not hold
+        /// a frame from `decode_for_gpu_sdk`, or comes from an R3D SDK whose
+        /// version does not match the GPU library.
         InvalidJobParameter_raw_host_mem = 4,
-        /// Raw device mem was NULL
+        /// The raw device memory is null.
         InvalidJobParameter_raw_device_mem = 5,
-        /// unsupported pixel type
+        /// The job's pixel type is not one this debayer can produce.
         InvalidJobParameter_pixelType = 6,
-        /// Output buffer Size must be non zero.
-        /// Output buffer must be allocated prior to passing it into the sdk
+        /// The output size is zero, or the output buffer was not allocated
+        /// before the job was processed.
         InvalidJobParameter_output_device_mem_size = 7,
         InvalidJobParameter_output_device_mem = 8,
-        /// Image processing settings ColorVersion was set to ColorVersion1 which is not supported by this SDK
+        /// The image processing settings ask for
+        /// [`ColorVersion::Version1`], which GPU processing does not support.
         InvalidJobParameter_ColorVersion1 = 9,
-        /// GPU Device did not meet minimum requirements.
+        /// The GPU falls short of the SDK's minimum requirements.
         UnableToUseGPUDevice = 10,
-        /// Error loading R3DSDK dynamic library
+        /// One of the SDK's dynamic libraries failed to load.
         UnableToLoadLibrary = 11,
         ParameterUnsupported = 12,
         InvalidAPIObject = 13,

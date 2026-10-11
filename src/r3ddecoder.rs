@@ -96,10 +96,20 @@ impl R3dDecoder {
 
 /// Options for an [`R3dDecoder`].
 ///
-/// The set routines on this class are available to tweak the performance characteristics of the R3DDecoder.
-/// The SDK will automatically choose sane defaults based upon which devices are chosen with the `use_*_device` calls, however if you need to restrict the SDK for a specific use case you can use the set routines to do so.
-/// The defaults the SDK chooses are usually core count - 1 for threads, and min(device memory * 0.75, concurrent GPU Frames * 1GB) for GPUs, for host memory the value is by default set to concurrentImageCount * 512MB,
-/// note if the device of the host actually runs out of memory the out of memory status will be returned from either the callback or the decode call, based upon when it occurs.  Memory pools do not pre-allocate the memory.
+/// Only a device is required, picked with
+/// [`use_cuda_device`](Self::use_cuda_device) or
+/// [`use_opencl_device`](Self::use_opencl_device). The SDK derives reasonable
+/// resource settings from that device; the other setters exist to cap or tune
+/// them for a particular workload. Typical derived values are:
+/// * thread counts: the number of CPU cores minus one;
+/// * host memory pool: 512 MB per concurrent image;
+/// * GPU memory pool: 1 GB per concurrent GPU frame, but at most 75% of the
+///   device's memory.
+///
+/// Pools grow as needed instead of reserving their full size up front. If the
+/// host or the device does run out of memory, the failure comes either from
+/// [`R3dDecoder::decode`] itself or from the future it returns, depending on
+/// when it happens.
 pub struct R3dDecoderOptions {
     ptr: *mut c_void,
     sdk: Sdk,
@@ -123,10 +133,15 @@ impl R3dDecoderOptions {
         self.ptr
     }
 
-    /// Sets the folder for temporary files and compiled kernels.
-    /// If set to empty string or not called no temporary folder will be used.
-    /// On some older boards the kernel compilation may take upwards of 5 seconds, this is present to mitigate that and make it a one time occurrence instead of per application run.
-    /// On modern boards the compilation time is hardly noticeable.
+    /// Directory where the SDK keeps temporary files and its compiled GPU
+    /// kernels. With an empty path, or when this is never called, the SDK
+    /// works without a scratch directory.
+    /// Caching the kernels means they are compiled once rather than on every
+    /// application start, which matters on some older graphics cards where
+    /// compiling can take more than 5 seconds; on current cards it is barely
+    /// noticeable.
+    ///
+    /// Fails with [`RedError::InvalidPath`] if `path` contains a NUL byte.
     pub fn set_scratch_folder(&mut self, path: &str) -> RedResult<()> {
         let c_path = std::ffi::CString::new(path).map_err(|_| RedError::InvalidPath)?;
         let self_ptr = self.ptr;
@@ -134,59 +149,77 @@ impl R3dDecoderOptions {
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", c_ptr as "const char *"] -> i32 as "int" { return self_ptr->setScratchFolder(std::string(c_ptr)); }))?;
         Ok(())
     }
-    /// This is the number of active CPU threads used for decompression of the footage.
-    /// This does not have a 1:1 ratio to the number of frames being processed at a time, a single frame in most cases will be split to operate on multiple of these task threads.
-    /// We recommend 1 - core count to prevent full CPU usage keeping you from interacting with the computer while processing.
+    /// Number of CPU worker threads that decompress the footage.
+    /// They work as a shared pool: one frame is usually spread over several
+    /// of them, so this is not the number of frames decoded at once.
+    /// RED suggests one fewer than the number of CPU cores, which leaves the
+    /// machine responsive while decoding.
     ///
-    /// 0 = use (cores - 1)
+    /// `0` selects that value (cores minus one).
     pub fn set_decompression_thread_count(&mut self, count: usize) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", count as "size_t"] -> i32 as "int" { return self_ptr->setDecompressionThreadCount(count); }))?;
         Ok(())
     }
-    /// This number determines how many threads will be used to manage the frame(s) lifetime, from your request all the way to the complete callback.
-    /// When you call decode, your request gets verified, prepared and then queued until one of these threads is available.
-    /// For each of these threads some buffers will need to be allocated in host memory to handle the decompression step.
+    /// Number of threads that each carry one frame through the whole pipeline,
+    /// from the [`R3dDecoder::decode`] call until its future resolves.
+    /// A submitted job is checked and prepared, then waits for one of these
+    /// threads to become free.
+    /// Each thread needs its own host buffers for decompression, so this also
+    /// scales host memory use, see [`set_memory_pool_size`](Self::set_memory_pool_size).
     ///
-    /// 0 = use (cores - 1)
+    /// `0` selects the number of CPU cores minus one.
     pub fn set_concurrent_image_count(&mut self, count: usize) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", count as "size_t"] -> i32 as "int" { return self_ptr->setConcurrentImageCount(count); }))?;
         Ok(())
     }
-    /// minimum 1024 recommended 4096 or higher
-    /// This value is used for allocations of Host memory, the value passed into here will need to scale for the value passed to [`set_concurrent_image_count`](R3dDecoderOptions::set_concurrent_image_count).
+    /// Size of the host memory pool, in megabytes. The minimum is 1024; 4096
+    /// or more is recommended.
+    /// Every concurrent image draws its buffers from this pool, so grow it
+    /// along with [`set_concurrent_image_count`](R3dDecoderOptions::set_concurrent_image_count).
     pub fn set_memory_pool_size(&mut self, size_mbs: usize) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", size_mbs as "size_t"] -> i32 as "int" { return self_ptr->setMemoryPoolSize(size_mbs); }))?;
         Ok(())
     }
 
-    /// minimum 1024 recommended 4096 or higher
-    /// The memory pool is used to keep larger buffers on the device around to be re-used between frames.
-    /// All of our GPU buffer types come from here, pinned, and temp processing buffers, if this is not high enough for the value passed to [`set_gpu_concurrent_frame_count`](R3dDecoderOptions::set_gpu_concurrent_frame_count) you will not be running as optimal as possible, though it should not be higher than what the graphics card has available.
+    /// Size of the GPU memory pool, in megabytes. The minimum is 1024; 4096
+    /// or more is recommended.
+    /// The decoder takes all of its GPU-side buffers from this pool, the
+    /// pinned transfer buffers and the temporary processing buffers included,
+    /// and keeps them between frames for reuse.
+    /// A pool too small for the [`set_gpu_concurrent_frame_count`](R3dDecoderOptions::set_gpu_concurrent_frame_count)
+    /// value costs performance. Do not make it larger than the memory the
+    /// graphics card actually has.
     pub fn set_gpu_memory_pool_size(&mut self, size_mbs: usize) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", size_mbs as "size_t"] -> i32 as "int" { return self_ptr->setGPUMemoryPoolSize(size_mbs); }))?;
         Ok(())
     }
-    /// Sets number of cudaStreams or OpenCL cl_command_queue(s).
-    /// minimum 1 - recommended 3 (if GPU has enough RAM)
-    /// This value determines how many frames we will attempt to process on the GPU at a time, a frame consists of HostToDevice/ run kernels/ DeviceToHost.
-    /// By increasing the number of frames you directly 1:1 increase memory requirement to process on the card.
-    /// The memory requirement to process a single frame on the GPU is not light as RED deals with very large frame sizes, there are also several other utility buffers needed when processing the larger of them are as follows: upload pinned buffer, temp processing buffer, download pinned buffer.
-    /// Due to the limitation of hardware only overlapping up to 3 of these actions, there is not much benefit to this number going above 3.
-    /// More about the hardware limitation: Modern GPU Devices support at most processing of 3 actions at once by overlapping actions in different streams/command queues.
-    /// The types of actions are: HostToDevice/Kernel/DeviceToHost.
-    /// The high end quadros can do one of each overlapped as they have 2 transfer engines and 1 kernel engine, where the Geforce line can only do 2 of them at a time meaning they cannot upload and download concurrently.
+    /// Number of frames in flight on the GPU at once, which is also the
+    /// number of CUDA streams or OpenCL command queues the decoder creates.
+    /// The minimum is 1; 3 is recommended when the card has the memory for it.
+    ///
+    /// Each frame is copied to the device, run through the processing kernels
+    /// and copied back. GPU memory use grows linearly with this value, and
+    /// one frame alone needs a lot, since RED frames are large and processing
+    /// them also takes helper buffers, chiefly pinned staging buffers for the
+    /// upload and the download and a temporary processing buffer.
+    ///
+    /// Going beyond 3 rarely helps: a GPU overlaps at most three operations
+    /// from different streams or queues, one host-to-device copy, one kernel
+    /// and one device-to-host copy. High-end Quadro cards, with two copy
+    /// engines and one compute engine, run all three at once. GeForce cards
+    /// manage only two, so their uploads and downloads never overlap.
     pub fn set_gpu_concurrent_frame_count(&mut self, count: usize) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", count as "size_t"] -> i32 as "int" { return self_ptr->setGPUConcurrentFrameCount(count); }))?;
         Ok(())
     }
 
-    /// returns a list of OpenCL devices compatible with SDK. Needs the SDK
-    /// initialized with [`InitializeFlags::R3DDecoder`].
+    /// The OpenCL devices the decoder can run on. Needs the SDK initialized
+    /// with [`InitializeFlags::R3DDecoder`].
     pub fn opencl_device_list(sdk: &Sdk) -> RedResult<Vec<OpenCLDeviceInfo>> {
         sdk.require(InitializeFlags::R3DDecoder)?;
         let mut list = Vec::<OpenCLDeviceInfo>::new();
@@ -203,8 +236,8 @@ impl R3dDecoderOptions {
         }))?;
         Ok(list)
     }
-    /// returns a list of CUDA devices compatible with SDK. Needs the SDK
-    /// initialized with [`InitializeFlags::R3DDecoder`].
+    /// The CUDA devices the decoder can run on. Needs the SDK initialized
+    /// with [`InitializeFlags::R3DDecoder`].
     pub fn cuda_device_list(sdk: &Sdk) -> RedResult<Vec<CudaDeviceInfo>> {
         sdk.require(InitializeFlags::R3DDecoder)?;
         let mut list = Vec::<CudaDeviceInfo>::new();
@@ -222,15 +255,19 @@ impl R3dDecoderOptions {
         Ok(list)
     }
 
-    /// sets the opencl device to be used by the decoder
-    /// cuda and opencl are mutually exclusive, you cannot combine usage of cuda and opencl on the same options instance
+    /// Decode on `device`, one of the entries of
+    /// [`opencl_device_list`](Self::opencl_device_list).
+    /// One options object drives either OpenCL or CUDA, never both, so do not
+    /// also call [`use_cuda_device`](Self::use_cuda_device) on it.
     pub fn use_opencl_device(&mut self, device: &OpenCLDeviceInfo) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", device as "const R3DSDK::OpenCLDeviceInfo *"] -> i32 as "int" { return self_ptr->useDevice(*device); }))?;
         Ok(())
     }
-    /// sets the cuda device to be used by the decoder
-    /// cuda and opencl are mutually exclusive, you cannot combine usage of cuda and opencl on the same options instance
+    /// Decode on `device`, one of the entries of
+    /// [`cuda_device_list`](Self::cuda_device_list).
+    /// One options object drives either CUDA or OpenCL, never both, so do not
+    /// also call [`use_opencl_device`](Self::use_opencl_device) on it.
     pub fn use_cuda_device(&mut self, device: &CudaDeviceInfo) -> RedResult<()> {
         let self_ptr = self.ptr;
         check_status::<R3DStatus>(cpp!(unsafe [self_ptr as "R3DSDK::R3DDecoderOptions *", device as "const R3DSDK::CudaDeviceInfo *"] -> i32 as "int" { return self_ptr->useDevice(*device); }))?;
@@ -248,19 +285,20 @@ cpp_class! {
 // explicitly; `Sync` falls out of the `[u8; N]` inline storage.
 unsafe impl Send for OpenCLDeviceInfo {}
 impl OpenCLDeviceInfo {
-    /// platform_id corresponds to a cl_platform_id which is actually _cl_platform_id *
-    /// must be set to choose a specific device.
+    /// The device's OpenCL platform, as a raw `cl_platform_id`. Together with
+    /// [`device_id`](Self::device_id) it is what identifies the device to
+    /// [`R3dDecoderOptions::use_opencl_device`].
     pub fn platform_id(&self) -> *mut c_void {
         cpp!(unsafe [self as "const R3DSDK::OpenCLDeviceInfo *"] -> *mut c_void as "void *" { return self->platform_id; })
     }
 
-    /// device_id corresponds to a cl_device_id which is actually _cl_device_id *
-    /// must be set to choose a specific device.
+    /// The OpenCL device, as a raw `cl_device_id`. See
+    /// [`platform_id`](Self::platform_id).
     pub fn device_id(&self) -> *mut c_void {
         cpp!(unsafe [self as "const R3DSDK::OpenCLDeviceInfo *"] -> *mut c_void as "void *" { return self->device_id; })
     }
 
-    /// used for feedback only; not used for any device selection logic.
+    /// Device name, for display. Device selection ignores it.
     pub fn name(&self) -> String {
         let ptr = cpp!(unsafe [self as "const R3DSDK::OpenCLDeviceInfo *"] -> *const u8 as "const char *" {
             return self->name;
@@ -268,7 +306,7 @@ impl OpenCLDeviceInfo {
         // SAFETY: the field is a `char[256]` array.
         string_from_c_array(unsafe { std::slice::from_raw_parts(ptr, 256) })
     }
-    /// used for feedback only; not used for any device selection logic.
+    /// Platform name, for display. Device selection ignores it.
     pub fn platform_name(&self) -> String {
         let ptr = cpp!(unsafe [self as "const R3DSDK::OpenCLDeviceInfo *"] -> *const u8 as "const char *" {
             return self->platform_name;
@@ -296,13 +334,15 @@ cpp_class! {
 // public surface. `Send` added explicitly (macro elides it); `Sync` auto.
 unsafe impl Send for CudaDeviceInfo {}
 impl CudaDeviceInfo {
-    /// pci_bus_id value must be set to choose a specific device bus id.
-    /// pci_bus_id corresponds to the cudaDeviceProp.pciBusID field
+    /// PCI bus of the device, the same number CUDA reports in
+    /// `cudaDeviceProp::pciBusID`. This is how
+    /// [`R3dDecoderOptions::use_cuda_device`] finds the device.
     pub fn pci_bus_id(&self) -> i32 {
         cpp!(unsafe [self as "const R3DSDK::CudaDeviceInfo *"] -> i32 as "int" { return self->pci_bus_id; })
     }
 
-    /// string name is required to ensure the pci bus id matches the proper device
+    /// Device name. The SDK checks it against the PCI bus ID, so that the bus
+    /// ID really refers to the intended device.
     pub fn name(&self) -> String {
         let ptr = cpp!(unsafe [self as "const R3DSDK::CudaDeviceInfo *"] -> *const u8 as "const char *" {
             return self->name;
@@ -387,8 +427,9 @@ impl R3dDecodeJob {
     pub fn clip(&self) -> Option<&Arc<Clip>> {
         self.clip.as_ref()
     }
-    /// 0 = main (A) track, 1 = EPIC/Scarlet-X highlight protection track 2 (X track),
-    /// ignored when doing HDRx blending
+    /// Video track to decode: `0` for the main (A) track, `1` for the X track,
+    /// the second, highlight-protection track that EPIC and Scarlet-X cameras
+    /// can record. Has no effect when the two tracks are blended (HDRx).
     pub fn set_video_track_no(&mut self, v: usize) {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "R3DSDK::R3DDecodeJob *", v as "size_t"] { self_ptr->videoTrackNo = v; })
@@ -401,8 +442,7 @@ impl R3dDecodeJob {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "const R3DSDK::R3DDecodeJob *"] -> usize as "size_t" { return self_ptr->videoFrameNo; })
     }
-    /// Resolution/speed to decode the image at. This will also
-    /// influence how much memory is needed for the output buffer
+    /// The decode mode, see [`set_mode`](Self::set_mode).
     pub fn mode(&self) -> VideoDecodeMode {
         enum_from_sdk(self.raw_mode())
     }
@@ -410,14 +450,15 @@ impl R3dDecodeJob {
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "const R3DSDK::R3DDecodeJob *"] -> i32 as "int" { return (int)self_ptr->mode; })
     }
-    /// Resolution/speed to decode the image at. This will also
-    /// influence how much memory is needed for the output buffer
+    /// Choose the decode mode, which trades output resolution for speed. The
+    /// mode also sets the size of the decoded image, and with it how large the
+    /// output buffer must be.
     pub fn set_mode(&mut self, v: VideoDecodeMode) {
         let v: i32 = v as i32;
         let self_ptr = self.ptr;
         cpp!(unsafe [self_ptr as "R3DSDK::R3DDecodeJob *", v as "int"] { self_ptr->mode = (R3DSDK::VideoDecodeMode)v; })
     }
-    /// Which pixel type to decode the image in. See the [`VideoPixelType`] enum for the available options.
+    /// The output pixel format, see [`set_pixel_type`](Self::set_pixel_type).
     pub fn pixel_type(&self) -> VideoPixelType {
         enum_from_sdk(self.raw_pixel_type())
     }
@@ -426,10 +467,9 @@ impl R3dDecodeJob {
         cpp!(unsafe [self_ptr as "const R3DSDK::R3DDecodeJob *"] -> i32 as "int" { return (int)self_ptr->pixelType; })
     }
 
-    /// Which pixel type to decode the image in. See the [`VideoPixelType`]
-    /// enum for the available options.
-    /// Using an unsupported pixel type will result in an `InvalidPixelType` error.
-    /// Supported pixel types:
+    /// Choose the pixel format of the decoded image. The decoder handles only
+    /// the [`VideoPixelType`] values below; with any other the decode fails
+    /// with [`RedError::InvalidJobParameterPixelType`].
     /// * [`VideoPixelType::Rgb16bitPlanar`]
     /// * [`VideoPixelType::Rgb16bitInterleaved`]
     /// * [`VideoPixelType::Dpx10bitMethodB`]
@@ -447,8 +487,8 @@ impl R3dDecodeJob {
     /// the buffer alive for as long as the SDK may write to it.
     ///
     /// # Safety
-    /// `buf` must be valid for writes of `size` bytes and aligned on a 16-byte
-    /// boundary until every decode of this job has completed: until the future
+    /// `buf` must be 16-byte aligned and stay valid for writes of `size` bytes
+    /// until every decode of this job has completed: until the future
     /// returned by [`R3dDecoder::decode`] resolves, or, if it is dropped first,
     /// until the SDK is done with the job, which is only known once the job
     /// itself is dropped.
@@ -503,8 +543,10 @@ impl R3dDecodeJob {
         buf
     }
 
-    /// Image processing settings to apply to the decode. These must be set.
-    /// The job keeps its own copy.
+    /// Set how the decoded image is processed (color, exposure and so on).
+    /// Required: without it [`R3dDecoder::decode`] fails with
+    /// [`RedError::InvalidJobParameter`]. The job stores its own copy of
+    /// `settings`.
     pub fn set_image_processing(&mut self, settings: &ImageProcessingSettings) {
         let settings: &ImageProcessingSettings = self.settings.insert(Box::new(*settings));
         let ptr = settings as *const ImageProcessingSettings;
@@ -527,7 +569,10 @@ impl R3dDecodeJob {
             self_ptr->outputFrameMetadata = new R3DSDK::Metadata();
         })
     }
-    /// Optionally return the decoded frame's per-frame metadata
+    /// Metadata of the decoded frame, filled in by the decode. Fails with
+    /// [`RedError::Other`] unless
+    /// [`allocate_frame_metadata`](Self::allocate_frame_metadata) was called
+    /// first.
     pub fn metadata(&self) -> RedResult<&Metadata> {
         if !self.metadata_allocated {
             return Err(RedError::Other("Metadata was not requested in the job".to_string()));

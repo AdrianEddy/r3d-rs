@@ -61,22 +61,31 @@ pub const HANDLE_FALLBACK: Handle = usize::MAX as *mut c_void;
 ///
 /// The SDK calls it from its worker threads, hence `Send + Sync`.
 pub trait IoInterface: Send + Sync {
-    /// Open file (binary, positioned at start). Return HANDLE_ERROR / HANDLE_FALLBACK or an opaque handle.
+    /// Open `path` as a binary file positioned at offset 0. Return a handle of
+    /// your own that is neither [`HANDLE_ERROR`] nor [`HANDLE_FALLBACK`];
+    /// [`HANDLE_ERROR`] if the file is missing or fails to open (the SDK also
+    /// probes for files that may not exist, like further clip parts and
+    /// sidecars); or [`HANDLE_FALLBACK`] to let the SDK open it itself.
     fn open(&self, path: &str, access: FileAccess) -> Handle;
 
-    /// File size for handle.
+    /// Length in bytes of the file behind `handle`.
     fn filesize(&self, handle: Handle) -> u64;
 
-    /// Close handle.
+    /// Close `handle`. The SDK may open the same file again later.
     fn close(&self, handle: Handle);
 
-    /// Read exactly `bytes` from `offset` into `out`. Return true on full read.
+    /// Fill `out` with the file's bytes starting at `offset`, returning
+    /// `true` only if all of `out` was filled. Reads come at any offset and
+    /// size, not necessarily in order.
     fn read(&self, out: &mut [u8], offset: u64, handle: Handle) -> bool;
 
-    /// Append/sequential write. Return true on full write.
+    /// Append `data` to the file, returning `true` only if all of it was
+    /// written.
     fn write(&self, data: &[u8], handle: Handle) -> bool;
 
-    /// Create output path if needed (camera streaming). Return true if ok or not needed.
+    /// Make sure the directory `path` exists before files are written into
+    /// it; only used when streaming from a camera. Return `true` if it exists
+    /// now, or `false` to have the SDK create it the usual way.
     fn create_path(&self, path: &str) -> bool;
 }
 
@@ -325,8 +334,8 @@ impl StreamIo {
 
     /// Provide streams for files that were not inserted, on demand. The callback
     /// returns the stream and optionally its size (otherwise found by seeking),
-    /// or `None` for files it does not serve. Callbacks are asked in the order
-    /// they were added.
+    /// or `None` for files it does not serve. Callbacks are tried in
+    /// insertion order.
     pub fn add_callback<F>(&self, cb: F) where F: Fn(&str) -> Option<(SharedStream, Option<u64>)> + Send + Sync + 'static {
         self.callbacks.write().unwrap().push(Box::new(cb));
     }

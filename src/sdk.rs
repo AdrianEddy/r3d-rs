@@ -51,9 +51,9 @@ impl std::fmt::Debug for Sdk {
 }
 
 impl Sdk {
-    /// Load the SDK. `path` must point to the folder with the SDK's dynamic
-    /// libraries, it cannot be an empty string. `flags` selects the optional
-    /// components to load.
+    /// Load the SDK, along with the optional components in `flags`. `path` is
+    /// the directory holding the SDK's dynamic libraries and must not be
+    /// empty.
     ///
     /// Fails with [`RedError::AlreadyInitialized`] if the SDK is loaded already.
     pub fn initialize(path: &str, flags: InitializeFlags) -> RedResult<Self> {
@@ -116,10 +116,11 @@ impl Sdk {
         }
     }
 
-    /// Returns version information for the static/API version as well as any dynamic
-    /// libraries successfully loaded. Can be called before [`Sdk::initialize`],
-    /// and returns useful information even if initialization failed. If possible log the
-    /// output of this function to a log file to help with customer issue debugging.
+    /// Describe the SDK version this crate was built against and the version
+    /// of each dynamic library loaded so far. It needs no [`Sdk`], so it also
+    /// works before [`Sdk::initialize`] and after a failed initialization.
+    /// Logging this string makes support requests and bug reports much easier
+    /// to diagnose.
     pub fn version() -> String {
         let ver: *const core::ffi::c_char = cpp!(unsafe [] -> *const core::ffi::c_char as "const char *" {
             return R3DSDK::GetSdkVersion();

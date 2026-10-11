@@ -25,9 +25,13 @@ cpp_class! {
     unsafe struct ClipHandle as "R3dRsClip"
 }
 
-/// Class for loading a clip, retrieving information and extracting images.
-/// This class is thread-safe as long as no call to [`load_from`](Clip::load_from)
-/// or [`close`](Clip::close) is in progress.
+/// An R3D clip: opens the files, reports clip information and metadata, and
+/// decodes video frames and audio.
+///
+/// A `Clip` can be shared between threads. The SDK only forbids using it
+/// while it is being opened or closed, and the methods that do either,
+/// [`load_from`](Clip::load_from) and [`close`](Clip::close), take
+/// `&mut self`, as do the few other calls the SDK does not allow to overlap.
 ///
 /// Asynchronous decode jobs take an `Arc<Clip>`, as they read the clip until
 /// they complete.
@@ -51,9 +55,9 @@ const _: () = assert!(std::mem::offset_of!(Clip, handle) == 0);
 unsafe impl Send for Clip {}
 
 impl Clip {
-    /// Create a new Clip instance. Use this if you do not want to load a clip
-    /// when constructing this class. Use [`load_from`](Clip::load_from) to load
-    /// a clip before calling any other functions.
+    /// Create a clip with no file loaded. Open one with
+    /// [`load_from`](Clip::load_from) before using anything else, or use
+    /// [`from_path`](Clip::from_path) to do both in one step.
     pub fn new(sdk: &Sdk) -> Self {
         let handle: ClipHandle = cpp!(unsafe [] -> ClipHandle as "R3dRsClip" { return R3dRsClip(new R3DSDK::Clip()); });
         Self { handle, sdk: sdk.clone() }
@@ -64,8 +68,11 @@ impl Clip {
         cpp!(unsafe [self as "const R3dRsClip *"] -> *mut c_void as "void *" { return self->get(); })
     }
 
-    /// Create a new Clip instance from a file path. Use this if you want to load a clip from a UTF-8
-    /// path when you construct the class.
+    /// Open the clip at `path`, as [`load_from`](Clip::load_from) does.
+    ///
+    /// # Errors
+    /// [`RedError::InvalidPath`] if `path` contains a NUL byte, otherwise the
+    /// error matching the [`LoadStatus`] the SDK reported.
     pub fn from_path(sdk: &Sdk, path: &str) -> RedResult<Self> {
         let c_path = std::ffi::CString::new(path).map_err(|_| RedError::InvalidPath)?;
         let c_ptr = c_path.as_ptr();
@@ -91,10 +98,13 @@ impl Clip {
         }))
     }
 
-    /// Load the R3D file from the given UTF-8 path. If there are any other R3D
-    /// files that belong to the same clip these will get loaded as well.
-    /// If a clip was already open it will be closed before opening the
-    /// one specified in the `path` parameter.
+    /// Open the clip at `path`, closing whatever this `Clip` had open before.
+    /// A clip recorded as several numbered R3D parts is opened as a whole:
+    /// pointing at one part also picks up the rest.
+    ///
+    /// # Errors
+    /// [`RedError::InvalidPath`] if `path` contains a NUL byte, otherwise the
+    /// error matching the [`LoadStatus`] the SDK reported.
     pub fn load_from(&mut self, path: &str) -> RedResult<()> {
         let c_path = std::ffi::CString::new(path).map_err(|_| RedError::InvalidPath)?;
         let c_ptr = c_path.as_ptr();
@@ -104,35 +114,36 @@ impl Clip {
         check_status::<LoadStatus>(status)
     }
 
-    /// Closes any open files (class destructor will also call this function).
+    /// Close the clip and its files. Dropping the `Clip` does this too.
     pub fn close(&mut self) {
         cpp!(unsafe [self as "const R3dRsClip *"]  { (*self)->Close(); })
     }
 
-    /// Closes all handles for all R3D parts belonging to the clip. Handles
-    /// will be re-opened on a per R3D part basis as needed automatically.
+    /// Let go of the OS file handles of every part of the clip, while keeping
+    /// it loaded. The SDK reopens a part on its own the next time it has to
+    /// read from it.
     pub fn close_file_handles(&mut self) {
         cpp!(unsafe [self as "const R3dRsClip *"]  { (*self)->CloseFileHandles(); })
     }
 
-    /// Indicates if RMD sidecar file was found when clip was loaded
+    /// Whether the clip had an RMD sidecar file next to it at load time.
     pub fn rmd_sidecar_present(&self) -> bool {
         cpp!(unsafe [self as "const R3dRsClip *"] -> bool as "bool" { return (*self)->RmdSidecarPresent(); })
     }
 
-    /// Retrieve the UTF-8 path for the RMD sidecar file the R3D SDK will look
-    /// for when trying to load or update an RMD file or create a new one.
-    /// You will receive a valid path even if no RMD file is present
-    /// Returns `None` if no clip has been (successfully) loaded.
+    /// Where the SDK expects this clip's RMD sidecar, both when reading it and
+    /// when writing a new or updated one. The path is given whether or not
+    /// the file exists. `None` before a clip is loaded.
     pub fn get_rmd_path(&self) -> Option<String> {
         string_from_c(cpp!(unsafe [self as "const R3dRsClip *"] -> *const c_char as "const char *" { return (*self)->GetRmdPath(); }))
     }
 
-    /// Checks frame CRC if present. For HDRx both tracks are checked. CRC specific return values:
+    /// Verify frame `video_frame_no` against the CRC stored with it. In HDRx
+    /// clips the frame of each track is verified.
     ///
-    /// - `Ok(())`: CRC present and matched
-    /// - [`RedError::DecodeFailed`]: CRC present and check failed
-    /// - [`RedError::UnsupportedClipFormat`]: clip/frame does not have CRC
+    /// - `Ok(())`: the frame has a CRC, and it matches.
+    /// - [`RedError::DecodeFailed`]: the frame has a CRC, but it does not match.
+    /// - [`RedError::UnsupportedClipFormat`]: the clip or frame stores no CRC.
     pub fn check_frame(&self, video_frame_no: usize) -> RedResult<()> {
         check_status::<DecodeStatus>(cpp!(unsafe [self as "const R3dRsClip *", video_frame_no as "size_t"] -> i32 as "int" {
             return (int)(*self)->CheckFrame(video_frame_no);
@@ -150,13 +161,13 @@ impl Clip {
         }
     }
 
-    /// Returns number of video tracks in clip. This will always return 1 for non-HDRx clips
+    /// Number of video tracks. Only HDRx clips have more than one.
     pub fn video_track_count(&self) -> usize {
         cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->VideoTrackCount(); })
     }
 
     // ******************************
-    // SYNCHRONOUS SOFTWARE DECODING (MAIN TRACK)
+    // BLOCKING CPU DECODE
     // ******************************
 
     /// Compute total buffer size in bytes for a decode with given clip dimensions, mode and pixel type.
@@ -174,8 +185,13 @@ impl Clip {
         AlignedBuffer::new(self.calculate_buffer_size(mode, pixel_type)?, align)
     }
 
-    /// Decode the given video frame with the supplied decode settings,
-    /// output buffer and image processing settings.
+    /// Decode frame `video_frame_no` on the CPU, at the resolution of `mode`
+    /// and in the layout of `pixel_type`.
+    ///
+    /// Without `image_settings` the clip's default look is used.
+    /// `hdr_settings` blends the two tracks of an HDRx clip, and makes the
+    /// decode fail for any other clip; without it an HDRx clip decodes its
+    /// main track.
     ///
     /// - If `buffer` is `Some`, it must be large enough and 16B-aligned; returns `Ok(None)` on success.
     /// - If `buffer` is `None`, it allocates a 16B-aligned buffer internally and returns `Ok(Some(buffer))`.
@@ -227,9 +243,9 @@ impl Clip {
     /// `buffer` MUST be 512-byte aligned — allocate it via
     /// `AlignedBuffer::new(size, 512)` where `size` is at least the maximum
     /// block size reported by [`Clip::audio_block_count_and_size`] (that value
-    /// is already a multiple of 512). Samples are 24- or 32-bit Big-Endian; for
-    /// 24-bit audio each sample is MSB-aligned in a 32-bit word (low 8 bits
-    /// zero), and multichannel audio is interleaved.
+    /// is already a multiple of 512). Samples are 24- or 32-bit Big-Endian
+    /// and take 4 bytes each; a 24-bit sample fills the top three bytes and
+    /// leaves the lowest one zero. Multichannel audio is interleaved.
     ///
     /// A clip without audio reports a maximum block size of 0, and
     /// `AlignedBuffer::new(0, _)` fails, so check
@@ -251,16 +267,16 @@ impl Clip {
         Ok(buffer_size)
     }
 
-    /// Decode `num_samples` raw audio samples (expressed *per channel* — do NOT
-    /// multiply by the channel count, the SDK does that) starting at
-    /// `start_sample` into `buffer`.
+    /// Decode `num_samples` raw audio samples starting at `start_sample` into
+    /// `buffer`. Both count samples *per channel*: the SDK accounts for the
+    /// channel count itself, so pass them unscaled.
     ///
     /// `buffer` MUST be 512-byte aligned — allocate it via
     /// `AlignedBuffer::new(size, 512)` with room for
     /// `align_to_512(num_samples * audio_channel_count() * 4)` bytes. Samples
     /// are 24- or 32-bit Big-Endian, interleaved across channels (see
     /// [`Clip::decode_audio_block`]). Fewer samples than requested are written
-    /// when `start_sample + num_samples` runs past the end of the clip.
+    /// when `start_sample + num_samples` runs past the clip's last sample.
     ///
     /// Returns the number of bytes actually written, always a multiple of
     /// `4 * audio_channel_count()`; the per-channel sample count is
@@ -284,9 +300,9 @@ impl Clip {
     // CLIP INFORMATION
     // ******************************
 
-    /// Get a unique 16-byte clip identifier. There is no guarantee that this
-    /// uuid follows the ITU-T Rec. X.667 / ISO/IEC 9834-8:2005 standards!
-    /// Returns `None` if no clip is loaded.
+    /// A 16-byte identifier unique to the clip, or `None` before a clip is
+    /// loaded. Treat it as opaque bytes: it is not guaranteed to be a
+    /// well-formed ISO/IEC 9834-8 (ITU-T X.667) UUID.
     pub fn uuid(&self) -> Option<[u8; 16]> {
         let mut uuid = [0u8; 16];
         let ptr = uuid.as_mut_ptr();
@@ -294,33 +310,33 @@ impl Clip {
         if result { Some(uuid) } else { None }
     }
 
-    /// Width of the clip, will return 0 if no clip is loaded.
+    /// Clip width in pixels, or 0 before a clip is loaded.
     pub fn width(&self) -> usize {
         cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->Width(); })
     }
 
-    /// Height of the clip, will return 0 if no clip is loaded.
+    /// Clip height in pixels, or 0 before a clip is loaded.
     pub fn height(&self) -> usize {
         cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->Height(); })
     }
 
-    /// Number of video frames in the clip, will return 0 if no clip is loaded.
+    /// Length of the clip in video frames, or 0 before a clip is loaded.
     pub fn video_frame_count(&self) -> usize {
         cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->VideoFrameCount(); })
     }
 
-    /// Number of audio channels in the clip, will return 0 if no
-    /// clip is loaded or if the clip does not have any audio. To
-    /// get the channel map (which of the 4 channels was used),
-    /// query the RMD_CHANNEL_MASK metadata item.
+    /// How many audio channels the clip has; 0 without a loaded clip or
+    /// audio. Which of the 4 possible channels were recorded is a bit mask
+    /// in the `"channel_mask"` [`metadata`](Clip::metadata) item
+    /// (`RMD_CHANNEL_MASK`).
     pub fn audio_channel_count(&self) -> usize {
         cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->AudioChannelCount(); })
     }
 
-    /// Number of audio blocks and their maximum size in the clip.
-    /// Returns `(0, 0)` if no clip is loaded, otherwise returns number of audio blocks and the maximum
-    /// buffer size that will be needed to process all audio blocks.
-    /// This size will be a multiple of 512 (guaranteed)
+    /// How many audio blocks the clip has, and a buffer size in bytes that
+    /// fits the largest of them; `(0, 0)` before a clip is loaded. The size
+    /// is always a multiple of 512, so it can be used as is for the buffer of
+    /// [`decode_audio_block`](Clip::decode_audio_block).
     pub fn audio_block_count_and_size(&self) -> (usize, usize) {
         let mut maximum_size: usize = 0;
         let ptr = &mut maximum_size as *mut usize;
@@ -330,65 +346,71 @@ impl Clip {
         (count, maximum_size)
     }
 
-    /// Number of audio samples *per channel* in the clip. All
-    /// channels have the exact same number of samples. Returns
-    /// 0 if an error is encountered or if the clip has no audio
+    /// Length of the audio in samples, counted *per channel* (every channel
+    /// is equally long). 0 on error or when there is no audio.
     pub fn audio_sample_count(&self) -> u64 {
         cpp!(unsafe [self as "const R3dRsClip *"] -> u64 as "uint64_t" { return (*self)->AudioSampleCount(); })
     }
 
-    /// Framerate for the video & audio 'track(s)'. Numerator & denominator
-    /// can be found separately in the metadata table. Will return 0.0 if no
-    /// clip is loaded.
+    /// Frame rate of the video and audio, or 0.0 before a clip is loaded. The
+    /// exact rational rate is in the `"framerate_numerator"` and
+    /// `"framerate_denominator"` [`metadata`](Clip::metadata) items.
     pub fn video_audio_framerate(&self) -> f32 {
         cpp!(unsafe [self as "const R3dRsClip *"] -> f32 as "float" { return (*self)->VideoAudioFramerate(); })
     }
 
-    /// Framerate for the timecode 'track'. This will be running at half the
-    /// video & audio 'track' rate if these are running at over 30 fps. The
-    /// timecode functions below will alternate '.' and ':' in that case!
-    /// Will return 0.0 if no clip is loaded.
+    /// Frame rate of the timecode, or 0.0 before a clip is loaded. For clips
+    /// above 30 fps this is half the video frame rate, as the timecode only
+    /// advances every second frame; see [`timecode`](Clip::timecode) for how
+    /// the two frames of a pair are told apart.
     pub fn timecode_framerate(&self) -> f32 {
         cpp!(unsafe [self as "const R3dRsClip *"] -> f32 as "float" { return (*self)->TimecodeFramerate(); })
     }
 
-    /// Retrieve the clip's default timecode 'track' for a given video frame.
-    /// This default was set on the camera when the clip was recorded.
-    /// Will return `None` if no clip is loaded or if `video_frame_no` is out of bounds.
+    /// Timecode of frame `video_frame_no`, taken from whichever track the
+    /// camera was set to use while recording:
+    /// [`absolute_timecode`](Clip::absolute_timecode) or
+    /// [`edge_timecode`](Clip::edge_timecode). `None` before a clip is loaded
+    /// or when the frame number is out of range.
     ///
-    /// You can encounter two kinds of timecodes in an R3D file:
+    /// Up to 30 fps each frame has its own timecode (`10:00:00:00`,
+    /// `10:00:00:01`, ...). Faster clips give two consecutive frames the same
+    /// timecode, written once with `.` separators and once with `:`
+    /// (`10.00.00.00`, then `10:00:00:00`, ...).
     ///
-    /// 01:00:00:00 -> 01:00:00:01 etc. for clips running at 30 fps and below
-    /// 01.00.00.00 -> 01:00:00:00 etc. for clips running over 30 fps
+    /// The SDK reuses its timecode string across these calls, so the
+    /// timecode getters take `&mut self`.
     pub fn timecode(&mut self, video_frame_no: usize) -> Option<String> {
         string_from_c(cpp!(unsafe [self as "const R3dRsClip *", video_frame_no as "size_t"] -> *const c_char as "const char *" {
             return (*self)->Timecode(video_frame_no);
         }))
     }
 
-    /// Retrieve the clip's absolute (time of day or external) timecode for
-    /// a given video frame. Will return `None` if no clip is loaded or if
-    /// `video_frame_no` is out of bounds.
+    /// Absolute timecode of frame `video_frame_no`: time of day, or a
+    /// timecode supplied to the camera externally. `None` before a clip is
+    /// loaded or when the frame number is out of range.
     pub fn absolute_timecode(&mut self, video_frame_no: usize) -> Option<String> {
         string_from_c(cpp!(unsafe [self as "const R3dRsClip *", video_frame_no as "size_t"] -> *const c_char as "const char *" {
             return (*self)->AbsoluteTimecode(video_frame_no);
         }))
     }
 
-    /// Retrieve the clip's edge (aka run record) timecode for a given video
-    /// frame. Will return `None` if no clip is loaded or `video_frame_no` is
-    /// out of bounds.
+    /// Edge timecode, also called run-record timecode, of frame
+    /// `video_frame_no`. `None` before a clip is loaded or when the frame
+    /// number is out of range.
     pub fn edge_timecode(&mut self, video_frame_no: usize) -> Option<String> {
         string_from_c(cpp!(unsafe [self as "const R3dRsClip *", video_frame_no as "size_t"] -> *const c_char as "const char *" {
             return (*self)->EdgeTimecode(video_frame_no);
         }))
     }
 
-    /// Get either the clip image processing settings or overriding RMD sidecar metadata
-    /// (display this in your UI as the clip defaults!). Use
+    /// The settings to present as the clip's defaults: those in its RMD
+    /// sidecar when it has one, otherwise the ones recorded in the clip.
     /// [`clip_image_processing_settings`](Clip::clip_image_processing_settings)
-    /// to always get the clip settings. PERFORMANCE WARNING: This function
-    /// will check for, and parse the RMD sidecar, EVERY time this function gets called!
+    /// ignores the sidecar.
+    ///
+    /// Every call looks for the sidecar on disk and parses it again, so keep
+    /// the result instead of calling this repeatedly.
     pub fn default_image_processing_settings(&self) -> ImageProcessingSettings {
         let mut settings = ImageProcessingSettings::default();
         let ptr_to_settings = &mut settings;
@@ -398,8 +420,8 @@ impl Clip {
         settings
     }
 
-    /// Get the image processing settings as they were set on camera when the clip was
-    /// recorded. Use this to offer "reset to clip/recorded metadata" in your application.
+    /// The settings the camera recorded with the clip, ignoring any RMD
+    /// sidecar. Handy for a "revert to as shot" action in an application.
     pub fn clip_image_processing_settings(&self) -> ImageProcessingSettings {
         let mut settings = ImageProcessingSettings::default();
         let ptr_to_settings = &mut settings;
@@ -409,12 +431,15 @@ impl Clip {
         settings
     }
 
-    /// Function to retrieve per-frame metadata. This is an expensive call as
-    /// the frame is loaded from the disk every time this function is called!
-    /// All decoder interfaces (Software & GPU) can return per-frame
-    /// metadata as frames are decoded which incurs no extra disk I/O hit.
-    /// Recommended use for this function is when dumping per-frame metadata
-    /// for all (or a certain range of) frames without needing the decoded image.
+    /// Read the per-frame metadata of frame `video_frame_no`.
+    ///
+    /// Each call reads the frame from disk, which is slow. When you decode the
+    /// frames anyway, have the decode hand out the metadata at no extra I/O
+    /// cost instead, e.g. with
+    /// [`AsyncDecompressJob::allocate_frame_metadata`](crate::AsyncDecompressJob::allocate_frame_metadata)
+    /// or [`R3dDecodeJob::allocate_frame_metadata`](crate::R3dDecodeJob::allocate_frame_metadata).
+    /// This method suits extracting the metadata of many frames when the
+    /// images themselves are not needed.
     pub fn metadata_for_frame(&self, video_frame_no: usize) -> RedResult<FrameMetadata> {
         let mut metadata = FrameMetadata::new(&self.sdk);
         let metadata_ptr: &mut Metadata = &mut metadata;
@@ -424,8 +449,8 @@ impl Clip {
         Ok(metadata)
     }
 
-    /// Retrieve a metadata item from the clip's metadata table.
-    /// Returns `None` if the key does not exist or if no clip is loaded.
+    /// The item named `key` in the clip's metadata table, or `None` when
+    /// there is no such item or no loaded clip.
     pub fn metadata(&self, key: &str) -> Option<Value> {
         let c_key = std::ffi::CString::new(key).ok()?;
         let c_key = c_key.as_ptr();
@@ -465,9 +490,12 @@ impl Clip {
         }
     }
 
-    /// Asynchronous IMU samples of V-RAPTOR recordings, see the RMD_FRAME_TIMESTAMP
-    /// metadata and [`metadata_for_frame`](Clip::metadata_for_frame) as well.
-    /// Returns an empty `Vec` if the range is empty or out of bounds.
+    /// The IMU (acceleration and rotation) samples of a V-RAPTOR recording
+    /// within the sample index `range`. They are not tied to video frames;
+    /// match them up through the per-frame `"frame_timestamp"` item
+    /// (`RMD_FRAME_TIMESTAMP`) of [`metadata_for_frame`](Clip::metadata_for_frame).
+    /// Returns an empty `Vec` if the range is empty or out of bounds, or the
+    /// SDK fails to read the samples.
     pub fn imu_samples<T: std::ops::RangeBounds<u64>>(&self, range: T) -> Vec<IMUSample> {
         let sample_count = cpp!(unsafe [self as "const R3dRsClip *"] -> usize as "size_t" { return (*self)->IMUSampleCount(); }) as u64;
 
